@@ -1,0 +1,4 @@
+# Local config (users copy .pushbackrc.example → .pushbackrc in their own repo)
+.pushbackrc
+.env.local
+.DS_Store

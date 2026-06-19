@@ -1,0 +1,44 @@
+# pushback config — copy to `.pushbackrc` in your project and edit.
+# It's a plain shell file (sourced by pushback), so no YAML parser is needed.
+# In most projects you only need PUSHBACK_SCHEME; everything else derives from
+# it or has a sane default. Pin the rest if you like belt-and-suspenders.
+
+# Cosmetic label shown in the banner.
+PUSHBACK_PRODUCT_NAME="my app"
+
+# Directory containing the Xcode project + project.yml, relative to repo root.
+PUSHBACK_APP_DIR="ios"
+
+# Xcode scheme (required). Defaults below derive from it:
+#   PROJECT      = <scheme>.xcodeproj
+#   TEST_TARGET  = <scheme>Tests
+#   APP_BUNDLE   = <scheme>.app
+PUSHBACK_SCHEME="MyApp"
+# PUSHBACK_PROJECT="MyApp.xcodeproj"
+# PUSHBACK_PROJECT_YML="project.yml"
+# PUSHBACK_EXPORT_OPTIONS="ExportOptions.plist"   # must set destination=upload
+
+# Version bump script, run from inside PUSHBACK_APP_DIR. pushback calls:
+#   <PUSHBACK_BUMP_SCRIPT> <PUSHBACK_BUMP_LEVEL>
+# It must edit MARKETING_VERSION / CURRENT_PROJECT_VERSION in project.yml.
+# PUSHBACK_BUMP_SCRIPT="./bump-version.sh"
+# PUSHBACK_BUMP_LEVEL="patch"   # patch | minor | major
+
+# QA gate (xcodebuild test + optional Maestro). Both auto-skip gracefully.
+# PUSHBACK_TEST_TARGET="MyAppTests"
+# PUSHBACK_MAESTRO_DIR="maestro"
+# PUSHBACK_SIM_DEVICE="iPhone 17"
+# PUSHBACK_APP_BUNDLE="MyApp.app"
+
+# App Store Connect API key. pushback reads the key id + issuer id from these
+# env vars; if unset, it sources them from PUSHBACK_ASC_ENV_FILE (any line
+# starting with PUSHBACK_ASC_ENV_PREFIX is exported). The .p8 must live at
+#   <PUSHBACK_ASC_KEY_DIR>/AuthKey_<keyid>.p8
+# PUSHBACK_ASC_KEY_ID_VAR="APPSTORE_CONNECT_API_KEY_ID"
+# PUSHBACK_ASC_ISSUER_ID_VAR="APPSTORE_CONNECT_API_ISSUER_ID"
+# PUSHBACK_ASC_ENV_FILE=".env.local"
+# PUSHBACK_ASC_ENV_PREFIX="APPSTORE_CONNECT_"
+# PUSHBACK_ASC_KEY_DIR="$HOME/.private_keys"
+
+# Files staged for the version-bump commit (relative to repo root).
+# PUSHBACK_COMMIT_PATHS="ios/project.yml ios/MyApp.xcodeproj/"
