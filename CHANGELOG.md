@@ -3,6 +3,11 @@
 All notable changes to `pushback` are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **`PUSHBACK_SIM_DEVICE` now accepts a UDID**, not just a name. A bare name is a prefix match (`iPhone 17` also resolves `iPhone 17 Pro`/`Pro Max`/`17e`, and duplicate names exist across OS runtimes), so with several matches — or two booted sims — `simctl install booted` and a device-less `maestro test` picked a device nondeterministically and flaked the QA gate. When the value is UDID-shaped it is now threaded into xcodebuild (`-destination id=`), `simctl install <udid>`, and `maestro --device <udid>`. Plain names keep the previous behavior.
+
 ## [0.1.0] — 2026-06-19
 
 Initial release. Extracted from the `ios/ship.sh` tooling in a private app repo.

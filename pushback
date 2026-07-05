@@ -132,6 +132,25 @@ fi
 : "${PUSHBACK_ASC_KEY_DIR:=$HOME/.private_keys}"
 : "${PUSHBACK_COMMIT_PATHS:=${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT_YML} ${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT}/}"
 
+# ── Resolve the simulator selector (name vs UDID) ──────────────────
+# PUSHBACK_SIM_DEVICE may be a name ("iPhone 17") or a UDID. A bare name is a
+# prefix match, so "iPhone 17" also resolves "iPhone 17 Pro"/"Pro Max"/"17e",
+# and duplicate names exist across OS runtimes. When several match — or two are
+# booted — `simctl install booted` and a device-less `maestro test` pick a
+# device nondeterministically and flake the QA gate. A UDID is unambiguous, so
+# when one is given, thread it into xcodebuild (id=), simctl (target the UDID,
+# not the ambient "booted" device), and maestro (--device). Names keep the old
+# behavior.
+if [[ "$PUSHBACK_SIM_DEVICE" =~ ^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$ ]]; then
+    PB_SIM_DESTINATION="platform=iOS Simulator,id=${PUSHBACK_SIM_DEVICE}"
+    PB_SIM_TARGET="$PUSHBACK_SIM_DEVICE"
+    PB_MAESTRO_DEVICE="$PUSHBACK_SIM_DEVICE"
+else
+    PB_SIM_DESTINATION="platform=iOS Simulator,name=${PUSHBACK_SIM_DEVICE},OS=latest"
+    PB_SIM_TARGET="booted"
+    PB_MAESTRO_DEVICE=""
+fi
+
 # ── Resolve paths ──────────────────────────────────────────────────
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
@@ -525,7 +544,7 @@ else
     run_xcodebuild test \
         -project "$PROJECT" \
         -scheme "$PUSHBACK_SCHEME" \
-        -destination "platform=iOS Simulator,name=${PUSHBACK_SIM_DEVICE},OS=latest" \
+        -destination "$PB_SIM_DESTINATION" \
         -derivedDataPath "$VERIFY_BUILD_DIR" \
         -only-testing:"$PUSHBACK_TEST_TARGET" \
         CODE_SIGN_IDENTITY="" \
@@ -538,8 +557,10 @@ else
         xcrun simctl boot "$PUSHBACK_SIM_DEVICE" 2>/dev/null || true
         APP_PATH="$(find "$VERIFY_BUILD_DIR" -name "$PUSHBACK_APP_BUNDLE" -type d | head -1)"
         if [ -n "$APP_PATH" ]; then
-            xcrun simctl install booted "$APP_PATH"
-            maestro test "$APP_DIR/$PUSHBACK_MAESTRO_DIR/" \
+            xcrun simctl install "$PB_SIM_TARGET" "$APP_PATH"
+            # shellcheck disable=SC2086  # PB_MAESTRO_DEVICE is a UDID (no spaces) or empty
+            maestro ${PB_MAESTRO_DEVICE:+--device $PB_MAESTRO_DEVICE} \
+                test "$APP_DIR/$PUSHBACK_MAESTRO_DIR/" \
                 --output "$APP_DIR/build/maestro-output.log" \
                 || fail "Maestro smoke failed. Review $APP_DIR/build/maestro-output.log."
         else
