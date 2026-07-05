@@ -27,6 +27,10 @@ PUSHBACK_SCHEME="MyApp"
 # QA gate (xcodebuild test + optional Maestro). Both auto-skip gracefully.
 # PUSHBACK_TEST_TARGET="MyAppTests"
 # PUSHBACK_MAESTRO_DIR="maestro"
+# Simulator target: a name or a UDID. A name is a prefix match ("iPhone 17"
+# also resolves "iPhone 17 Pro"/"Pro Max"/"17e", and names repeat across OS
+# runtimes), which flakes the gate when several match or two sims are booted.
+# Prefer a UDID (`xcrun simctl list devices`) for a stable, unambiguous target.
 # PUSHBACK_SIM_DEVICE="iPhone 17"
 # PUSHBACK_APP_BUNDLE="MyApp.app"
 
