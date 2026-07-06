@@ -546,7 +546,7 @@ pushback --config ios/.pushbackrc</pre>
     ["preflight","Verify build","Compile for the simulator first. If it doesn't build, nothing gets merged or bumped. You find out in seconds, not after the upload."],
     ["final checks","QA gate","Unit and snapshot tests, plus Maestro smoke flows if you have them. The gate runs before anything irreversible happens."],
     ["pushback","Merge the PR","Detects the open PR, checks your local HEAD matches it, then squash-merges it into main. The first move of departure."],
-    ["taxi","Sync main","Pulls main back down so your local tree matches the squash that just landed — no drift before the climb."],
+    ["taxi","Sync main","Pulls the freshly merged main down so your local tree matches what just shipped. No drift before the climb."],
     ["line up","Bump version","Bumps the marketing and build number with your own bump script. Lined up on the runway and ready."],
     ["takeoff","Archive","The signed release build, using your App Store Connect API key. No Keychain juggling, no provisioning detours."],
     ["climb","Upload to TestFlight","One xcodebuild step both packages and uploads. No altool follow-up, no Transporter window to babysit."],
