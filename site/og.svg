@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="'JetBrains Mono','SFMono-Regular',ui-monospace,monospace">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="-5%" r="80%">
+      <stop offset="0%" stop-color="#ffb000" stop-opacity="0.20"/>
+      <stop offset="55%" stop-color="#ffb000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c9ccd2"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f6c659"/>
+      <stop offset="100%" stop-color="#ffb000"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0a0b0e"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- brand -->
+  <text x="80" y="118" font-size="30" font-weight="700" letter-spacing="1">
+    <tspan fill="#ffb000">✈</tspan><tspan fill="#eceae3" dx="14">pushback</tspan>
+  </text>
+  <rect x="318" y="92" width="176" height="36" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.18"/>
+  <text x="406" y="116" font-size="17" fill="#9aa0ab" text-anchor="middle" letter-spacing="1">v0.1.0 · MIT</text>
+
+  <!-- headline -->
+  <text x="80" y="300" font-size="78" font-weight="800" font-family="'Bricolage Grotesque','Hanken Grotesk',sans-serif" letter-spacing="-2" fill="url(#ink)">From the gate to the</text>
+  <text x="80" y="392" font-size="78" font-weight="800" font-family="'Bricolage Grotesque','Hanken Grotesk',sans-serif" letter-spacing="-2">
+    <tspan fill="url(#amber)">App Store</tspan><tspan fill="url(#ink)">, in one command.</tspan>
+  </text>
+
+  <!-- subhead -->
+  <text x="82" y="452" font-size="27" fill="#9aa0ab" font-family="'Hanken Grotesk',sans-serif">Ship an iOS app to TestFlight from your laptop. No CI, no Ruby, no Fastlane.</text>
+
+  <!-- terminal line -->
+  <g transform="translate(80,506)">
+    <rect x="0" y="0" width="700" height="64" rx="12" fill="#121419" stroke="#ffffff" stroke-opacity="0.14"/>
+    <text x="24" y="41" font-size="24"><tspan fill="#ffb000">$</tspan><tspan fill="#eceae3" dx="14">pushback</tspan><tspan fill="#5dd39e" dx="22">✓ Shipped 1.4.3 (62)</tspan></text>
+  </g>
+
+  <text x="1120" y="556" font-size="20" fill="#646a76" text-anchor="end">taylorshivers.com</text>
+</svg>

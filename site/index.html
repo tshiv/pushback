@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pushback: ship an iOS app to TestFlight in one command</title>
+<meta name="description" content="From the gate to the App Store, in one command. pushback ships an iOS app to TestFlight from your laptop. No CI, no Ruby, no Fastlane setup tax. One bash script, built for solo devs." />
+<meta name="theme-color" content="#0a0b0e" />
+<link rel="canonical" href="https://pushback-swart.vercel.app/" />
+
+<!-- Open Graph / social. Swap og.svg for a PNG if you want guaranteed iMessage/Twitter previews. -->
+<meta property="og:type" content="website" />
+<meta property="og:title" content="pushback: ship an iOS app to TestFlight in one command" />
+<meta property="og:description" content="From the gate to the App Store, in one command. No CI, no Ruby, no Fastlane setup tax. One bash script, built for solo devs." />
+<meta property="og:url" content="https://pushback-swart.vercel.app/" />
+<meta property="og:image" content="https://pushback-swart.vercel.app/og.svg" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="pushback: ship an iOS app to TestFlight in one command" />
+<meta name="twitter:description" content="From the gate to the App Store, in one command. No CI, no Ruby, no Fastlane setup tax." />
+<meta name="twitter:image" content="https://pushback-swart.vercel.app/og.svg" />
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0b0e'/%3E%3Ctext x='32' y='44' font-size='38' text-anchor='middle' fill='%23ffb000'%3E%E2%9C%88%3C/text%3E%3C/svg%3E" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700;12..96,800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+
+<style>
+  :root{
+    --bg:#0a0b0e; --bg-2:#0d0f13;
+    --panel:#121419; --panel-2:#171a21; --panel-3:#1d212a;
+    --ink:#eceae3; --ink-dim:#9aa0ab; --ink-faint:#646a76;
+    --amber:#ffb000; --amber-soft:#f6c659;
+    --green:#5dd39e; --blue:#79a9ff; --cyan:#5fd0c5; --red:#ff6f61;
+    --line:rgba(255,255,255,.08); --line-2:rgba(255,255,255,.14);
+    --maxw:1080px;
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"Hanken Grotesk",-apple-system,BlinkMacSystemFont,sans-serif;
+    --display:"Bricolage Grotesque",var(--sans);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:17px; line-height:1.65;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    overflow-x:hidden;
+  }
+
+  /* Atmosphere: apron glow + faint runway grid + grain */
+  body::before{
+    content:""; position:fixed; inset:0; z-index:-2; pointer-events:none;
+    background:
+      radial-gradient(120% 80% at 50% -10%, rgba(255,176,0,.16), transparent 55%),
+      radial-gradient(90% 60% at 85% 10%, rgba(121,169,255,.08), transparent 60%),
+      linear-gradient(180deg, var(--bg-2), var(--bg) 40%);
+  }
+  body::after{
+    content:""; position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.035;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 24px}
+  a{color:inherit}
+
+  /* ── Nav ── */
+  header.nav{
+    position:sticky; top:0; z-index:50;
+    backdrop-filter:blur(10px); background:rgba(10,11,14,.6);
+    border-bottom:1px solid var(--line);
+  }
+  .nav-in{display:flex; align-items:center; justify-content:space-between; height:60px}
+  .brand{display:flex; align-items:center; gap:10px; font-family:var(--mono); font-weight:700; letter-spacing:.02em}
+  .brand .plane{color:var(--amber); transform:translateY(-1px)}
+  .nav-right{display:flex; align-items:center; gap:18px; font-family:var(--mono); font-size:13px}
+  .chip{
+    border:1px solid var(--line-2); border-radius:999px; padding:3px 10px;
+    color:var(--ink-dim); font-size:12px; letter-spacing:.04em;
+  }
+  .nav-right a{color:var(--ink-dim); text-decoration:none; transition:color .2s}
+  .nav-right a:hover{color:var(--ink)}
+
+  /* ── Hero ── */
+  .hero{padding:84px 0 40px; text-align:center; position:relative}
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:10px; font-family:var(--mono);
+    font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--amber-soft);
+    border:1px solid rgba(255,176,0,.28); border-radius:999px; padding:6px 14px;
+    background:rgba(255,176,0,.05);
+  }
+  .eyebrow .dot{width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 10px var(--green); animation:pulse 2.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  h1{
+    font-family:var(--display); font-weight:800;
+    font-size:clamp(38px,6.6vw,76px); line-height:1.02; letter-spacing:-.02em;
+    margin:26px auto 0; max-width:16ch;
+    background:linear-gradient(180deg,#fff,#cfd2d8);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  h1 .accent{
+    background:linear-gradient(180deg,var(--amber-soft),var(--amber));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .sub{
+    margin:22px auto 0; max-width:54ch; color:var(--ink-dim);
+    font-size:clamp(17px,2.2vw,21px); line-height:1.55;
+  }
+  .sub b{color:var(--ink); font-weight:600}
+
+  .cmd{
+    display:flex; align-items:center; gap:12px; margin:34px auto 0; max-width:680px;
+    background:var(--panel); border:1px solid var(--line-2); border-radius:12px;
+    padding:14px 14px 14px 18px; font-family:var(--mono); font-size:14px;
+    box-shadow:0 20px 50px -20px rgba(0,0,0,.7);
+  }
+  .cmd .prompt{color:var(--amber); user-select:none}
+  .cmd code{flex:1; overflow-x:auto; white-space:nowrap; text-align:left; color:var(--ink); scrollbar-width:none}
+  .cmd code::-webkit-scrollbar{display:none}
+  .copy{
+    flex:none; cursor:pointer; border:1px solid var(--line-2); background:var(--panel-2);
+    color:var(--ink-dim); border-radius:8px; padding:7px 12px; font-family:var(--mono);
+    font-size:12px; transition:all .18s; display:inline-flex; align-items:center; gap:6px;
+  }
+  .copy:hover{color:var(--ink); border-color:var(--amber); background:rgba(255,176,0,.08)}
+  .copy.done{color:var(--green); border-color:var(--green)}
+
+  .cta{display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin-top:26px}
+  .btn{
+    display:inline-flex; align-items:center; gap:9px; text-decoration:none;
+    font-family:var(--mono); font-size:14px; font-weight:500; letter-spacing:.01em;
+    padding:13px 22px; border-radius:10px; transition:all .2s; cursor:pointer; border:1px solid transparent;
+  }
+  .btn-primary{background:var(--amber); color:#1a1305; font-weight:700}
+  .btn-primary:hover{transform:translateY(-2px); box-shadow:0 14px 30px -10px rgba(255,176,0,.5)}
+  .btn-ghost{border-color:var(--line-2); color:var(--ink)}
+  .btn-ghost:hover{border-color:var(--ink); background:rgba(255,255,255,.04); transform:translateY(-2px)}
+
+  /* ── Departure board ── */
+  .board{
+    margin:56px auto 0; max-width:760px; background:#08090c;
+    border:1px solid var(--line-2); border-radius:14px; padding:18px;
+    box-shadow:0 30px 70px -30px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.04);
+    font-family:var(--mono);
+  }
+  .board-head{
+    display:flex; justify-content:space-between; align-items:center;
+    color:var(--amber); font-size:13px; letter-spacing:.22em; padding:0 4px 12px;
+    border-bottom:1px solid var(--line); margin-bottom:10px;
+  }
+  .board-grid{display:grid; grid-template-columns:1.1fr 1.6fr 1fr 1.2fr; gap:8px}
+  .board-grid .col-h{color:var(--ink-faint); font-size:11px; letter-spacing:.14em; padding:4px}
+  .flap{
+    position:relative; background:linear-gradient(180deg,#15171c,#0d0f13);
+    border:1px solid rgba(255,255,255,.06); border-radius:5px;
+    padding:9px 8px; font-size:14px; letter-spacing:.06em; color:var(--ink);
+    overflow:hidden; transform-origin:center top;
+  }
+  .flap::after{content:""; position:absolute; left:0; right:0; top:50%; height:1px; background:rgba(0,0,0,.55)}
+  .flap.go{color:var(--green)}
+  .flap.soon{color:var(--amber-soft)}
+  .board-row.dim .flap{opacity:.62}
+  .anim .flap{animation:flip .5s cubic-bezier(.2,.7,.3,1) both}
+  @keyframes flip{from{transform:rotateX(-92deg); opacity:0}to{transform:rotateX(0); opacity:1}}
+
+  /* ── Sections ── */
+  section{padding:72px 0; position:relative}
+  .sec-label{
+    font-family:var(--mono); font-size:12px; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--amber-soft); display:flex; align-items:center; gap:12px;
+  }
+  .sec-label::before{content:""; width:26px; height:1px; background:var(--amber-soft); opacity:.6}
+  h2{
+    font-family:var(--display); font-weight:700; letter-spacing:-.02em;
+    font-size:clamp(28px,4.4vw,44px); line-height:1.08; margin:16px 0 0; max-width:20ch;
+  }
+  .lead{color:var(--ink-dim); font-size:19px; max-width:60ch; margin:16px 0 0}
+  .lead b{color:var(--ink); font-weight:600}
+
+  /* ── Terminal ── */
+  .term{
+    margin:38px auto 0; background:#0b0c0f; border:1px solid var(--line-2);
+    border-radius:14px; overflow:hidden; box-shadow:0 40px 90px -36px rgba(0,0,0,.85);
+  }
+  .term-bar{display:flex; align-items:center; gap:8px; padding:13px 16px; border-bottom:1px solid var(--line); background:#0e1014}
+  .tl{width:12px; height:12px; border-radius:50%}
+  .tl.r{background:#ff5f56}.tl.y{background:#ffbd2e}.tl.g{background:#27c93f}
+  .term-title{margin-left:10px; font-family:var(--mono); font-size:12px; color:var(--ink-faint)}
+  .term-body{
+    padding:20px 22px; font-family:var(--mono); font-size:13.5px; line-height:1.85;
+    white-space:pre-wrap; word-break:break-word; min-height:300px;
+  }
+  .term-body .ln{opacity:0; transform:translateY(4px); transition:opacity .26s ease, transform .26s ease}
+  .term.run .ln{opacity:1; transform:none}
+  .reduce .term-body .ln{opacity:1; transform:none}
+  .c-amber{color:var(--amber)} .c-green{color:var(--green)} .c-blue{color:var(--blue)}
+  .c-cyan{color:var(--cyan)} .c-dim{color:var(--ink-faint)} .c-ink{color:var(--ink)}
+  .b{font-weight:700}
+  .cursor{display:inline-block; width:8px; height:16px; background:var(--amber); vertical-align:-3px; animation:blink 1.1s step-end infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  /* ── Flight pipeline ── */
+  .flight{margin-top:42px; position:relative}
+  .leg{
+    position:relative; padding:0 0 30px 56px;
+  }
+  .leg::before{ /* the flight path rail */
+    content:""; position:absolute; left:17px; top:6px; bottom:-6px; width:2px;
+    background:repeating-linear-gradient(180deg,var(--line-2) 0 6px,transparent 6px 12px);
+  }
+  .leg:last-child::before{display:none}
+  .leg .node{
+    position:absolute; left:6px; top:2px; width:24px; height:24px; border-radius:50%;
+    background:var(--panel-2); border:1px solid var(--line-2); display:grid; place-items:center;
+    font-family:var(--mono); font-size:11px; color:var(--amber-soft); z-index:1;
+  }
+  .leg .phase{font-family:var(--mono); font-size:11px; letter-spacing:.18em; text-transform:uppercase; color:var(--ink-faint)}
+  .leg h3{margin:3px 0 0; font-size:18px; font-weight:600; font-family:var(--display); letter-spacing:-.01em}
+  .leg .arrow{color:var(--amber); margin:0 8px; font-family:var(--mono)}
+  .leg p{margin:6px 0 0; color:var(--ink-dim); font-size:15.5px; max-width:58ch}
+
+  /* ── Cards / safety ── */
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:38px}
+  .card{
+    background:linear-gradient(180deg,var(--panel),var(--bg-2));
+    border:1px solid var(--line); border-radius:16px; padding:26px;
+    transition:border-color .25s, transform .25s;
+  }
+  .card:hover{border-color:var(--line-2); transform:translateY(-3px)}
+  .card .k{font-family:var(--mono); font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--amber-soft)}
+  .card h3{margin:12px 0 0; font-family:var(--display); font-weight:700; font-size:21px; letter-spacing:-.01em}
+  .card p{margin:10px 0 0; color:var(--ink-dim); font-size:15.5px}
+  .card p code, .leg p code, .lead code{font-family:var(--mono); font-size:.86em; color:var(--amber-soft); background:rgba(255,176,0,.08); padding:1px 6px; border-radius:5px}
+
+  .pull{
+    font-family:var(--display); font-weight:700; font-size:clamp(24px,3.6vw,34px);
+    letter-spacing:-.02em; line-height:1.2; margin:0; max-width:24ch;
+  }
+  .pull .amber{color:var(--amber)}
+
+  /* ── Positioning table ── */
+  .when{display:grid; gap:14px; margin-top:36px}
+  .when-row{
+    display:grid; grid-template-columns:170px 1fr; gap:20px; align-items:start;
+    padding:20px 22px; border:1px solid var(--line); border-radius:14px; background:var(--panel);
+  }
+  .when-row.me{border-color:rgba(255,176,0,.35); background:linear-gradient(180deg,rgba(255,176,0,.06),transparent)}
+  .when-tool{font-family:var(--mono); font-weight:700; font-size:16px; color:var(--ink)}
+  .when-row.me .when-tool{color:var(--amber)}
+  .when-tool .tag{display:block; font-size:11px; font-weight:400; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-faint); margin-top:4px}
+  .when-row p{margin:0; color:var(--ink-dim); font-size:15.5px}
+  .when-row p a{color:var(--ink); text-underline-offset:3px}
+
+  .note{
+    margin-top:30px; border-left:2px solid var(--line-2); padding:4px 0 4px 22px;
+    color:var(--ink-dim); font-size:15.5px; max-width:62ch;
+  }
+  .note b{color:var(--ink)}
+
+  /* ── Install ── */
+  .steps{counter-reset:s; margin-top:38px; display:grid; gap:24px}
+  .istep{display:grid; grid-template-columns:38px 1fr; gap:18px; align-items:start}
+  .istep .num{
+    counter-increment:s; width:38px; height:38px; border-radius:10px; display:grid; place-items:center;
+    font-family:var(--mono); font-weight:700; color:var(--amber); border:1px solid rgba(255,176,0,.3);
+    background:rgba(255,176,0,.05);
+  }
+  .istep .num::before{content:counter(s)}
+  .istep h3{margin:6px 0 0; font-size:18px; font-weight:600; font-family:var(--display)}
+  .istep p{margin:6px 0 0; color:var(--ink-dim); font-size:15.5px}
+  .codeblock{
+    margin:12px 0 0; background:#0b0c0f; border:1px solid var(--line-2); border-radius:10px;
+    font-family:var(--mono); font-size:13px; position:relative;
+  }
+  .codeblock pre{margin:0; padding:16px 18px; overflow-x:auto; line-height:1.7}
+  .codeblock .copy{position:absolute; top:10px; right:10px}
+  .codeblock .cm{color:var(--ink-faint)} .codeblock .v{color:var(--cyan)} .codeblock .s{color:var(--green)}
+
+  .req{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
+  .req span{font-family:var(--mono); font-size:12px; color:var(--ink-dim); border:1px solid var(--line); border-radius:7px; padding:5px 10px}
+  .req span b{color:var(--amber-soft); font-weight:500}
+
+  /* ── Footer ── */
+  footer{border-top:1px solid var(--line); padding:64px 0 80px; margin-top:40px}
+  .foot-note{max-width:60ch; color:var(--ink-dim); font-size:16px; line-height:1.7}
+  .foot-note b{color:var(--ink)}
+  .foot-meta{display:flex; flex-wrap:wrap; gap:8px 22px; align-items:center; margin-top:28px; font-family:var(--mono); font-size:13px; color:var(--ink-faint)}
+  .foot-meta a{color:var(--ink-dim); text-decoration:none; transition:color .2s}
+  .foot-meta a:hover{color:var(--amber)}
+  .foot-meta .sep{opacity:.4}
+
+  /* reveal on scroll */
+  .reveal{opacity:0; transform:translateY(18px); transition:opacity .6s ease, transform .6s ease}
+  .reveal.in{opacity:1; transform:none}
+  .reduce .reveal{opacity:1; transform:none}
+
+  @media (max-width:760px){
+    .grid2{grid-template-columns:1fr}
+    .when-row{grid-template-columns:1fr; gap:8px}
+    .board{padding:14px}
+    .board-head{font-size:11px; letter-spacing:.14em}
+    .board-grid{grid-template-columns:.85fr 1.5fr 1.05fr}
+    .board .col-gate, .board .cell-gate{display:none}
+    .flap{font-size:12px; letter-spacing:.02em; padding:8px 7px}
+    .board-grid .col-h{font-size:10px; letter-spacing:.08em}
+    .cmd{flex-wrap:wrap}
+    .cmd code{white-space:normal; word-break:break-all}
+  }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-in">
+    <div class="brand"><span class="plane">✈</span> pushback</div>
+    <div class="nav-right">
+      <span class="chip">v0.1.0 · MIT</span>
+      <a href="#install">Install</a>
+      <a href="https://github.com/tshiv/pushback" target="_blank" rel="noopener">GitHub ↗</a>
+    </div>
+  </div>
+</header>
+
+<main>
+<!-- ── HERO ── -->
+<section class="hero">
+  <div class="wrap">
+    <span class="eyebrow"><span class="dot"></span> Now departing · laptop to TestFlight</span>
+    <h1>From the gate to the<br><span class="accent">App Store</span>, in one command.</h1>
+    <p class="sub">Ship an iOS app to TestFlight from your laptop. <b>No CI, no Ruby, no Fastlane setup tax.</b> One bash script that does the whole release in a single pass.</p>
+
+    <div class="cmd">
+      <span class="prompt">$</span>
+      <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/tshiv/pushback/main/install.sh | bash</code>
+      <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/tshiv/pushback/main/install.sh | bash" aria-label="Copy install command">Copy</button>
+    </div>
+
+    <div class="cta">
+      <a class="btn btn-primary" href="#install">Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/tshiv/pushback" target="_blank" rel="noopener">View source ↗</a>
+    </div>
+
+    <!-- Departure board -->
+    <div class="board reveal" id="board" aria-label="Departure board: PB 001 to TestFlight via one command, on time">
+      <div class="board-head"><span>✈ DEPARTURES</span><span id="clock">--:--</span></div>
+      <div class="board-grid">
+        <div class="col-h">FLIGHT</div><div class="col-h">DESTINATION</div><div class="col-h col-gate">GATE</div><div class="col-h">STATUS</div>
+      </div>
+      <div class="board-grid board-row" style="margin-top:8px">
+        <div class="flap">PB·001</div><div class="flap">TESTFLIGHT</div><div class="flap cell-gate">main</div><div class="flap go">ON TIME</div>
+      </div>
+      <div class="board-grid board-row dim" style="margin-top:8px">
+        <div class="flap">PB·002</div><div class="flap">APP STORE</div><div class="flap cell-gate">next</div><div class="flap soon">BOARDING</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── TERMINAL DEMO ── -->
+<section>
+  <div class="wrap">
+    <div class="sec-label reveal">The whole release</div>
+    <h2 class="reveal">One command. Eight steps. You watch it go.</h2>
+    <p class="lead reveal">This is a real <code>pushback</code> run in PR mode: it verifies the build, runs the gate, merges the PR, bumps the version, archives, uploads, and pushes. You type one thing and walk away.</p>
+
+    <div class="term reveal" id="term">
+      <div class="term-bar">
+        <span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
+        <span class="term-title">~/flip-or-pass · pushback</span>
+      </div>
+      <div class="term-body" id="termbody"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── THE FLIGHT (pipeline) ── -->
+<section>
+  <div class="wrap">
+    <div class="sec-label reveal">The flight plan</div>
+    <h2 class="reveal">Every leg of the trip, in order.</h2>
+    <p class="lead reveal">The name is the joke and the spec. In aviation, <b>pushback</b> is the tug easing the plane off the gate, the first move of departure. Here is each leg, start to wheels-down.</p>
+
+    <div class="flight" id="flight"></div>
+  </div>
+</section>
+
+<!-- ── SAFETY ── -->
+<section>
+  <div class="wrap">
+    <div class="sec-label reveal">Slow is smooth, smooth is fast</div>
+    <h2 class="reveal">The two things it refuses to get wrong.</h2>
+    <p class="lead reveal">A release tool earns trust by what it will not do. pushback is careful in exactly the two places where a mistake actually costs you.</p>
+
+    <div class="grid2">
+      <div class="card reveal">
+        <div class="k">Pre-merge</div>
+        <h3>A broken build can't land in <code>main</code>.</h3>
+        <p>pushback detects the open PR for your branch, checks your local HEAD matches it, and verifies the build compiles <b>before</b> the squash-merge. Most setups catch a broken build after the merge. pushback catches it before, so <code>main</code> stays shippable.</p>
+      </div>
+      <div class="card reveal">
+        <div class="k">Burned build numbers</div>
+        <h3>It never reverts a number the upload already burned.</h3>
+        <p>Once the upload to App Store Connect succeeds, that build number is gone. Reuse it and your next run fails validation. If the upload lands but the commit doesn't, pushback leaves the bump in place and tells you exactly what to run. It knows the one thing you must never undo.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── POSITIONING ── -->
+<section>
+  <div class="wrap">
+    <div class="sec-label reveal">Honest positioning</div>
+    <h2 class="reveal">Reach for the right tool.</h2>
+    <p class="lead reveal">pushback is not trying to be Fastlane, and it's not a fastlane killer. It's the glue for one specific case, made first-class. Here's when to use what.</p>
+
+    <div class="when">
+      <div class="when-row me reveal">
+        <div class="when-tool">pushback<span class="tag">this thing</span></div>
+        <p>One app. One person. Shipping from a laptop, no CI. You just want the build on TestFlight without the ceremony. It drives <code>xcodebuild</code>, <code>git</code>, <code>gh</code>, and <code>xcodegen</code> directly. iOS only, on purpose.</p>
+      </div>
+      <div class="when-row reveal">
+        <div class="when-tool">Fastlane<span class="tag">incumbent</span></div>
+        <p>A team sharing certificates (<code>match</code>), automating App Store metadata and screenshots, or running inside CI. If that's you, use <a href="https://fastlane.tools" target="_blank" rel="noopener">Fastlane</a>. It's great at it.</p>
+      </div>
+      <div class="when-row reveal">
+        <div class="when-tool">asc<span class="tag">power tool</span></div>
+        <p>You want fine-grained control over the App Store Connect API from a scriptable Go binary, with 1,200+ endpoints to compose yourself. <a href="https://asccli.sh" target="_blank" rel="noopener">asc</a> is the toolkit; pushback is the opinionated workflow.</p>
+      </div>
+      <div class="when-row reveal">
+        <div class="when-tool">Xcode + altool<span class="tag">built in</span></div>
+        <p>You ship rarely and don't mind the clicks: Archive, Export, Upload, by hand, every time. Free, manual, and fine for a couple releases a year.</p>
+      </div>
+    </div>
+
+    <p class="note reveal"><b>What it isn't:</b> it's a 30KB bash script, not a platform. iOS only. It assumes you use <code>xcodegen</code> with a <code>project.yml</code> and ship with <code>gh</code>. No screenshots, no metadata, no multi-platform, no dashboard. If you need those, that's Fastlane's job, not this one.</p>
+  </div>
+</section>
+
+<!-- ── INSTALL ── -->
+<section id="install">
+  <div class="wrap">
+    <div class="sec-label reveal">Get started</div>
+    <h2 class="reveal">Install, point it at your app, ship.</h2>
+
+    <div class="steps">
+      <div class="istep reveal">
+        <div class="num"></div>
+        <div>
+          <h3>Install the script</h3>
+          <p>One file onto your <code>PATH</code>. No package manager, no runtime.</p>
+          <div class="codeblock">
+            <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/tshiv/pushback/main/install.sh | bash" aria-label="Copy install command">Copy</button>
+            <pre><span class="cm"># installs to the first writable dir on your PATH</span>
+curl -fsSL https://raw.githubusercontent.com/tshiv/pushback/main/install.sh | bash</pre>
+          </div>
+          <div class="req">
+            <span>needs <b>git</b></span><span>needs <b>gh</b></span><span>needs <b>xcodegen</b></span><span>needs <b>Xcode</b></span><span>needs <b>App Store Connect API key</b></span>
+            <span>optional <b>xcbeautify</b></span><span>optional <b>maestro</b></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="istep reveal">
+        <div class="num"></div>
+        <div>
+          <h3>Add a tiny config</h3>
+          <p>Drop a <code>.pushbackrc</code> in your project. It's plain shell, so no YAML parser. In most projects you only set the scheme; everything else derives from it.</p>
+          <div class="codeblock">
+            <button class="copy" data-copy='PUSHBACK_PRODUCT_NAME="my app"
+PUSHBACK_APP_DIR="ios"
+PUSHBACK_SCHEME="MyApp"' aria-label="Copy config">Copy</button>
+            <pre><span class="cm"># ios/.pushbackrc</span>
+<span class="v">PUSHBACK_PRODUCT_NAME</span>=<span class="s">"my app"</span>
+<span class="v">PUSHBACK_APP_DIR</span>=<span class="s">"ios"</span>
+<span class="v">PUSHBACK_SCHEME</span>=<span class="s">"MyApp"</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="istep reveal">
+        <div class="num"></div>
+        <div>
+          <h3>Rehearse, then ship</h3>
+          <p>Run a dry run first. It does everything reversible and stubs the merge, archive, upload, and push, then reverts the bump. When it looks right, drop the flag.</p>
+          <div class="codeblock">
+            <button class="copy" data-copy="pushback --config ios/.pushbackrc --dry-run
+pushback --config ios/.pushbackrc" aria-label="Copy run commands">Copy</button>
+<pre><span class="cm"># rehearse the whole thing, change nothing</span>
+pushback --config ios/.pushbackrc --dry-run
+
+<span class="cm"># then for real: auto-detects an open PR, else ships the current branch</span>
+pushback --config ios/.pushbackrc</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p class="foot-note">
+      I built pushback for myself. I got tired of bouncing between Xcode, the terminal, and the App Store Connect dashboard every time I wanted to ship a small fix, so I wrote that half hour into one command.
+      <br><br>
+      It's a bash script. It's iOS only. It fits a solo dev shipping one app from a laptop, and if that's you, it'll save you the same half hour it saves me. If it's not, no hard feelings (<b>Fastlane is right there, and it's good</b>). Either way, go ship the thing.
+    </p>
+    <div class="foot-meta">
+      <span>pushback v0.1.0</span><span class="sep">·</span>
+      <span>MIT</span><span class="sep">·</span>
+      <span>by Taylor Shivers, Shivers LLC</span><span class="sep">·</span>
+      <a href="https://github.com/tshiv/pushback" target="_blank" rel="noopener">GitHub ↗</a><span class="sep">·</span>
+      <a href="https://taylorshivers.com" target="_blank" rel="noopener">taylorshivers.com ↗</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if(reduce) document.body.classList.add("reduce");
+
+  /* clock on the departure board */
+  function tick(){
+    var d=new Date(), h=(""+d.getHours()).padStart(2,"0"), m=(""+d.getMinutes()).padStart(2,"0");
+    var el=document.getElementById("clock"); if(el) el.textContent=h+":"+m;
+  }
+  tick(); setInterval(tick, 1000*15);
+
+  /* copy buttons */
+  document.querySelectorAll(".copy").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var text = btn.getAttribute("data-copy");
+      navigator.clipboard && navigator.clipboard.writeText(text).then(function(){
+        var old = btn.textContent; btn.textContent="Copied ✓"; btn.classList.add("done");
+        setTimeout(function(){ btn.textContent=old; btn.classList.remove("done"); }, 1600);
+      });
+    });
+  });
+
+  /* flight pipeline data */
+  var legs = [
+    ["preflight","Verify build","Compile for the simulator first. If it doesn't build, nothing gets merged or bumped. You find out in seconds, not after the upload."],
+    ["final checks","QA gate","Unit and snapshot tests, plus Maestro smoke flows if you have them. The gate runs before anything irreversible happens."],
+    ["pushback","Merge the PR","Detects the open PR, checks your local HEAD matches it, then squash-merges it into main. The first move of departure."],
+    ["taxi","Sync main","Pulls the freshly merged main down so your local tree matches what just shipped. No drift before the climb."],
+    ["line up","Bump version","Bumps the marketing and build number with your own bump script. Lined up on the runway and ready."],
+    ["takeoff","Archive","The signed release build, using your App Store Connect API key. No Keychain juggling, no provisioning detours."],
+    ["climb","Upload to TestFlight","One xcodebuild step both packages and uploads. No altool follow-up, no Transporter window to babysit."],
+    ["arrived","Commit & push","Commits the version bump and pushes it. You land back on a clean tree, build already processing in App Store Connect."]
+  ];
+  var fl = document.getElementById("flight");
+  legs.forEach(function(l, i){
+    var d = document.createElement("div");
+    d.className = "leg reveal";
+    d.innerHTML = '<div class="node">'+(i+1)+'</div>'+
+      '<div class="phase">'+l[0]+'</div>'+
+      '<h3>'+l[1]+'</h3>'+
+      '<p>'+l[2]+'</p>';
+    fl.appendChild(d);
+  });
+
+  /* reveal on scroll */
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){ e.target.classList.add("in"); io.unobserve(e.target); }
+    });
+  }, {threshold:0.12, rootMargin:"0px 0px -40px 0px"});
+  document.querySelectorAll(".reveal").forEach(function(el){ io.observe(el); });
+
+  /* departure board flip-in when seen */
+  var board = document.getElementById("board");
+  var bo = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){
+        if(!reduce){
+          board.classList.add("anim");
+          var flaps = board.querySelectorAll(".flap");
+          flaps.forEach(function(f, i){ f.style.animationDelay = (0.04*i)+"s"; });
+        }
+        bo.unobserve(e.target);
+      }
+    });
+  }, {threshold:0.3});
+  bo.observe(board);
+
+  /* terminal demo */
+  var T = [
+    ['<span class="c-dim">$</span> <span class="c-ink">pushback 37</span>',''],
+    ['',''],
+    ['  <span class="c-blue b">✈  Ship to TestFlight</span>',''],
+    ['  <span class="c-dim">flip or pass · ios · pr #37 → main</span>',''],
+    ['  <span class="c-dim">version: 1.4.2 (61) → 1.4.3 (62)</span>',''],
+    ['  <span class="c-dim">────────────────────────────────────────────</span>',''],
+    ['',''],
+    ['  About to <span class="b">merge PR #37</span> and ship <span class="b">1.4.3 (62)</span> to TestFlight.',''],
+    ['  <span class="b">Continue?</span> <span class="c-dim">[y/N]</span> y',''],
+    ['',''],
+    ['  <span class="c-blue b">[1/8]</span> <span class="b">Verify build</span>',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 18s</span>',''],
+    ['  <span class="c-blue b">[2/8]</span> <span class="b">QA suite (unit + Maestro)</span>',''],
+    ['  <span class="c-cyan">▸</span> Unit + snapshot tests',''],
+    ['  <span class="c-cyan">▸</span> Maestro smoke flows',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 1m04s</span>',''],
+    ['  <span class="c-blue b">[3/8]</span> <span class="b">Merge PR #37 (squash)</span>',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 3s</span>',''],
+    ['  <span class="c-blue b">[4/8]</span> <span class="b">Sync main</span>',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 2s</span>',''],
+    ['  <span class="c-blue b">[5/8]</span> <span class="b">Bump version</span>',''],
+    ['  <span class="c-cyan">▸</span> → 1.4.3 (62)',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 1s</span>',''],
+    ['  <span class="c-blue b">[6/8]</span> <span class="b">Archive release build</span>',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 2m11s</span>',''],
+    ['  <span class="c-blue b">[7/8]</span> <span class="b">Upload to TestFlight</span>',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 1m46s</span>',''],
+    ['  <span class="c-blue b">[8/8]</span> <span class="b">Commit + push version bump</span>',''],
+    ['  <span class="c-green">✓</span> <span class="c-dim">done in 2s</span>',''],
+    ['  <span class="c-dim">────────────────────────────────────────────</span>',''],
+    ['  <span class="c-green b">✓ Shipped 1.4.3 (62)</span>  <span class="c-dim">· total 5m27s</span>',''],
+    ['  <span class="c-dim">TestFlight processing, appears in App Store Connect shortly.</span>','']
+  ];
+  var termbody = document.getElementById("termbody");
+  var term = document.getElementById("term");
+
+  function buildStatic(){
+    termbody.innerHTML = T.map(function(r){ return '<span class="ln">'+r[0]+'</span>'; }).join("\n");
+  }
+
+  function play(){
+    termbody.innerHTML = "";
+    var i = 0;
+    function next(){
+      if(i >= T.length){
+        var cur = document.createElement("span");
+        cur.className="cursor"; termbody.appendChild(cur); return;
+      }
+      var span = document.createElement("span");
+      span.className = "ln"; span.innerHTML = T[i][0] + (i < T.length-1 ? "\n" : "");
+      termbody.appendChild(span);
+      requestAnimationFrame(function(){ span.style.opacity=1; span.style.transform="none"; });
+      termbody.scrollTop = termbody.scrollHeight;
+      i++;
+      var line = T[i-1][0];
+      var delay = /done in|Shipped/.test(line) ? 360 : (line.trim()==="" ? 60 : 150);
+      setTimeout(next, delay);
+    }
+    next();
+  }
+
+  if(reduce){ buildStatic(); }
+  else {
+    var played=false;
+    var to = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting && !played){ played=true; play(); to.unobserve(e.target); }
+      });
+    }, {threshold:0.25});
+    to.observe(term);
+  }
+})();
+</script>
+</body>
+</html>
