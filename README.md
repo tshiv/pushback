@@ -174,6 +174,19 @@ Store Connect — reusing it fails validation. So `pushback`'s failure handler:
 
 It never reverts a burned build number.
 
+### Build artifacts
+
+Every intermediate lives under `<app dir>/build/`: the verify build, the unit
+test run, the archive's DerivedData (`build/archive`), the `.xcarchive`, and the
+export directory. Each is removed as soon as it's no longer needed, and the
+whole `build/` tree is swept on success.
+
+Nothing is written to `~/Library/Developer/Xcode/DerivedData`. That matters if
+you ship from git worktrees: Xcode keys its default DerivedData location on the
+`.xcodeproj` absolute path, so each worktree would otherwise get its own cache
+that survives the worktree's deletion. Keeping the cache in `build/` means it
+dies with the checkout.
+
 ---
 
 ## Configuration
