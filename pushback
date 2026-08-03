@@ -162,6 +162,11 @@ EXPORT_OPTIONS="$APP_DIR/$PUSHBACK_EXPORT_OPTIONS"
 ARCHIVE_PATH="$APP_DIR/build/${PUSHBACK_SCHEME}.xcarchive"
 EXPORT_DIR="$APP_DIR/build/export"
 VERIFY_BUILD_DIR="$APP_DIR/build/verify"
+# Pin the archive's DerivedData too. Xcode's default location is keyed on the
+# .xcodeproj ABSOLUTE path, so shipping from a git worktree would mint a fresh
+# ~2 GB cache under ~/Library/Developer/Xcode/DerivedData that outlives the
+# worktree. Keeping it here means it dies with the worktree.
+ARCHIVE_BUILD_DIR="$APP_DIR/build/archive"
 
 # ── Pipeline state (read by cleanup_on_failure) ────────────────────
 # A bump that's been uploaded must NEVER be reverted (build number burned).
@@ -616,12 +621,13 @@ step_done
 # ── Step: Archive ──────────────────────────────────────────────────
 
 step "Archive release build"
-rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR"
+rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$ARCHIVE_BUILD_DIR"
 run_xcodebuild archive \
     -project "$PROJECT" \
     -scheme "$PUSHBACK_SCHEME" \
     -archivePath "$ARCHIVE_PATH" \
     -destination "generic/platform=iOS" \
+    -derivedDataPath "$ARCHIVE_BUILD_DIR" \
     -allowProvisioningUpdates \
     -authenticationKeyPath "$API_KEY_FILE" \
     -authenticationKeyID "$API_KEY_ID" \
@@ -646,6 +652,9 @@ run_xcodebuild -exportArchive \
     -authenticationKeyIssuerID "$API_ISSUER_ID" \
     || fail "Export/upload failed."
 [ "$DRY_RUN" = "0" ] && UPLOAD_SUCCEEDED=1
+# The archive's DerivedData is ~2 GB and nothing downstream reads it (export
+# works off the .xcarchive), so reclaim it now rather than at the final sweep.
+rm -rf "$ARCHIVE_BUILD_DIR"
 step_done
 
 # ── Step: Commit + push version bump ───────────────────────────────
