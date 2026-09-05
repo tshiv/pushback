@@ -307,11 +307,17 @@ restore_stash_if_any() {
         STASHED=0
         if git -C "$REPO_ROOT" stash apply "$STASH_SHA" >/dev/null 2>&1; then
             # Re-find the entry's current position right before dropping it.
-            local entry
-            entry="$(git -C "$REPO_ROOT" stash list --format='%gd %H' \
-                | awk -v sha="$STASH_SHA" '$2==sha{print $1; exit}')"
-            [ -n "$entry" ] && git -C "$REPO_ROOT" stash drop "$entry" >/dev/null 2>&1
-            note "restored your stashed working-tree changes"
+            # apply + drop is not atomic like pop, so say so if the drop fails
+            # rather than leaving a stash that would re-apply on a later pop.
+            local entry=""
+            entry="$(git -C "$REPO_ROOT" stash list --format='%gd %H' 2>/dev/null \
+                | awk -v sha="$STASH_SHA" '$2==sha{print $1; exit}')" || true
+            if [ -n "$entry" ] && git -C "$REPO_ROOT" stash drop "$entry" >/dev/null 2>&1; then
+                note "restored your stashed working-tree changes"
+            else
+                warn "Restored your stashed changes, but couldn't drop the stash entry ($STASH_SHA)."
+                warn "Drop it by hand so a later 'git stash pop' doesn't re-apply it: git stash list"
+            fi
         else
             warn "Couldn't auto-restore your stashed changes (likely a conflict)."
             warn "They're safe. Recover with: git -C \"$REPO_ROOT\" stash apply $STASH_SHA"
@@ -323,19 +329,30 @@ restore_stash_if_any() {
 # rehearsed bump. Restores TO the pre-ship snapshot, not to HEAD: in include
 # mode the user's own uncommitted edits to project.yml live in these paths,
 # and a plain `git checkout --` would silently discard them.
+# Called from the EXIT trap, so everything it prints goes to stderr and it
+# always returns 0. The snapshot was taken against HEAD, so the reset must be
+# to HEAD as well: a bare `git checkout --` restores from the INDEX, which is
+# the wrong base whenever the user had staged edits. Content is preserved;
+# the staged/unstaged split is not (include mode stages everything anyway).
 restore_commit_paths() {
     # shellcheck disable=SC2086
-    (cd "$REPO_ROOT" && git checkout -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+    (cd "$REPO_ROOT" && git checkout HEAD -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
     if [ -n "$PRE_SHIP_PATCH" ] && [ -s "$PRE_SHIP_PATCH" ]; then
         if git -C "$REPO_ROOT" apply --binary "$PRE_SHIP_PATCH" 2>/dev/null; then
-            note "restored your pre-ship edits to $PUSHBACK_COMMIT_PATHS"
+            note "restored your pre-ship edits to $PUSHBACK_COMMIT_PATHS" >&2
         else
-            warn "Couldn't re-apply your pre-ship edits to $PUSHBACK_COMMIT_PATHS."
-            warn "They're saved as a patch: git -C \"$REPO_ROOT\" apply $PRE_SHIP_PATCH"
-            return
+            # Keep the only copy of the user's edits somewhere macOS won't reap.
+            local keep="$REPO_ROOT/pushback-preship.patch"
+            mv -f "$PRE_SHIP_PATCH" "$keep" 2>/dev/null || keep="$PRE_SHIP_PATCH"
+            warn "Couldn't re-apply your pre-ship edits to $PUSHBACK_COMMIT_PATHS." >&2
+            warn "They're saved as a patch against HEAD: git -C \"$REPO_ROOT\" apply $keep" >&2
+            PRE_SHIP_PATCH=""
+            return 0
         fi
     fi
-    [ -n "$PRE_SHIP_PATCH" ] && rm -f "$PRE_SHIP_PATCH"
+    [ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
+    PRE_SHIP_PATCH=""
+    return 0
 }
 
 cleanup_on_failure() {
@@ -360,6 +377,9 @@ cleanup_on_failure() {
             printf "      git -C %q push origin %s\n" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
         fi
         restore_stash_if_any
+        # Whatever is left here was never needed (nothing was reverted, so the
+        # user's edits are still in the tree). Don't leave it in $TMPDIR.
+        [ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
         echo >&2
         hr >&2
         printf "  ${RED}${BOLD}✗ pushback failed${RESET}  ${DIM}(exit %d, after %s)${RESET}\n" \
@@ -625,10 +645,9 @@ fi
 if [ "$MODE" = "pr" ]; then
     # xcodegen may have touched the committed .xcodeproj during verify. Restore
     # it so the tree is clean before merge; otherwise the post-merge checkout
-    # would strand the pipeline. (PR mode requires a clean tree, so the
-    # snapshot is empty and this is a plain restore to HEAD.)
-    # shellcheck disable=SC2086
-    (cd "$REPO_ROOT" && git checkout -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+    # would strand the pipeline. PR mode requires a clean tree (see the guard
+    # above), so the snapshot is empty and this is a plain restore to HEAD.
+    restore_commit_paths
 
     step "Merge PR #$PR_NUMBER (squash)"
     if [ "$DRY_RUN" = "1" ]; then
@@ -737,7 +756,7 @@ fi
 # ── Done ───────────────────────────────────────────────────────────
 
 rm -rf "$APP_DIR/build"
-[ -n "$PRE_SHIP_PATCH" ] && rm -f "$PRE_SHIP_PATCH"
+[ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
 
 TOTAL=$((SECONDS - SHIP_START))
 echo
