@@ -5,9 +5,9 @@ The landing page for [pushback](https://github.com/tshiv/pushback). One self-con
 
 ## Files
 
-- `index.html` — the whole page (CSS + JS inline)
-- `og.svg` — social share card referenced by the OG meta tags
-- `README.md` — this file
+- `index.html`: the whole page (CSS + JS inline)
+- `og.svg`: social share card referenced by the OG meta tags
+- `README.md`: this file
 
 ## Preview locally
 

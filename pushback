@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pushback — ship an iOS app to TestFlight in one command, from your laptop.
+# pushback: ship an iOS app to TestFlight in one command, from your laptop.
 #
 # It does the whole release in a single pass: verify the build, run the QA
 # gate, (optionally) merge the PR, bump the version, archive, upload to
@@ -15,13 +15,13 @@
 #
 #   From-main mode No open PR (e.g. you're on `main` with everything already
 #                  merged, or on a local branch). pushback ships the current
-#                  branch's *current state* — including uncommitted working-
+#                  branch's *current state*, including uncommitted working-
 #                  tree changes, if you choose to include them. Nothing is
 #                  merged; the version-bump commit lands on the current branch.
 #
 # The one invariant that matters most: once the upload to App Store Connect
 # succeeds, the bumped build number is BURNED. pushback will never revert a
-# bump after a successful upload — doing so would make the next run reuse the
+# bump after a successful upload, since doing so would make the next run reuse the
 # number and fail ASC validation. See cleanup_on_failure().
 #
 # pushback is configured per-project via a sourced shell file (`.pushbackrc`); see
@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-PUSHBACK_VERSION="0.1.0"
+PUSHBACK_VERSION="0.1.1"
 
 # ── Argument parsing ───────────────────────────────────────────────
 
@@ -46,7 +46,7 @@ CONFIG_PATH=""
 
 print_help() {
     cat <<'EOF'
-pushback — ship an iOS app to TestFlight in one command.
+pushback: ship an iOS app to TestFlight in one command.
 
 USAGE
   pushback [options] [PR_NUMBER]
@@ -112,7 +112,7 @@ fi
 # shellcheck disable=SC1090
 . "$CONFIG_PATH"
 
-# Defaults — a minimal config need only set PUSHBACK_SCHEME.
+# Defaults. A minimal config need only set PUSHBACK_SCHEME.
 : "${PUSHBACK_PRODUCT_NAME:=app}"
 : "${PUSHBACK_APP_DIR:=ios}"
 : "${PUSHBACK_SCHEME:?config must set PUSHBACK_SCHEME}"
@@ -135,8 +135,8 @@ fi
 # ── Resolve the simulator selector (name vs UDID) ──────────────────
 # PUSHBACK_SIM_DEVICE may be a name ("iPhone 17") or a UDID. A bare name is a
 # prefix match, so "iPhone 17" also resolves "iPhone 17 Pro"/"Pro Max"/"17e",
-# and duplicate names exist across OS runtimes. When several match — or two are
-# booted — `simctl install booted` and a device-less `maestro test` pick a
+# and duplicate names exist across OS runtimes. When several match, or two are
+# booted, `simctl install booted` and a device-less `maestro test` pick a
 # device nondeterministically and flake the QA gate. A UDID is unambiguous, so
 # when one is given, thread it into xcodebuild (id=), simctl (target the UDID,
 # not the ambient "booted" device), and maestro (--device). Names keep the old
@@ -176,6 +176,8 @@ UPLOAD_SUCCEEDED=0
 VERSION_BUMP_COMMITTED=0
 PUSHED=0
 STASHED=0
+STASH_SHA=""        # commit SHA of the pre-ship stash (never trust stack position)
+PRE_SHIP_PATCH=""   # user's own uncommitted edits to the commit paths, restored on revert
 TARGET_BRANCH=""
 
 # ── App Store Connect API key ──────────────────────────────────────
@@ -187,8 +189,8 @@ if [ -z "${!PUSHBACK_ASC_KEY_ID_VAR:-}" ] || [ -z "${!PUSHBACK_ASC_ISSUER_ID_VAR
         eval "$(grep "^${PUSHBACK_ASC_ENV_PREFIX}" "$ENV_FILE" | sed 's/^/export /')"
     fi
 fi
-API_KEY_ID="${!PUSHBACK_ASC_KEY_ID_VAR:?$PUSHBACK_ASC_KEY_ID_VAR not set — add to $PUSHBACK_ASC_ENV_FILE or export it}"
-API_ISSUER_ID="${!PUSHBACK_ASC_ISSUER_ID_VAR:?$PUSHBACK_ASC_ISSUER_ID_VAR not set — add to $PUSHBACK_ASC_ENV_FILE or export it}"
+API_KEY_ID="${!PUSHBACK_ASC_KEY_ID_VAR:?$PUSHBACK_ASC_KEY_ID_VAR not set. Add it to $PUSHBACK_ASC_ENV_FILE or export it}"
+API_ISSUER_ID="${!PUSHBACK_ASC_ISSUER_ID_VAR:?$PUSHBACK_ASC_ISSUER_ID_VAR not set. Add it to $PUSHBACK_ASC_ENV_FILE or export it}"
 
 # ── Visual helpers ─────────────────────────────────────────────────
 # Honor NO_COLOR (https://no-color.org/) and skip ANSI on a non-TTY stdout.
@@ -238,7 +240,7 @@ step_done() {
 }
 
 step_skip() {
-    printf "  ${YELLOW}⊘${RESET} ${DIM}skipped — %s${RESET}\n" "$1"
+    printf "  ${YELLOW}⊘${RESET} ${DIM}skipped: %s${RESET}\n" "$1"
 }
 
 # Run a quiet/silent command with a braille spinner so long steps show
@@ -282,7 +284,7 @@ run_xcodebuild() {
 }
 
 confirm() {
-    # confirm "<prompt>" — returns 0 on yes. Honors --yes; on a non-TTY with
+    # confirm "<prompt>" returns 0 on yes. Honors --yes; on a non-TTY with
     # no --yes it refuses (so an unattended run can't hang on read).
     if [ "$ASSUME_YES" = "1" ]; then return 0; fi
     if [ ! -t 0 ]; then
@@ -295,17 +297,62 @@ confirm() {
 }
 
 # Restore a stash made for "ship HEAD only", on both success and failure.
-# Never drops the stash on conflict — the user's work stays recoverable.
+# The entry is addressed by its commit SHA, never by stack position: the stash
+# stack is shared across every worktree of the repo, and another session can
+# push its own entry on top during a multi-minute archive. A bare `stash pop`
+# would then restore the wrong stash and leave ours behind. Never drops the
+# stash on conflict, so the user's work stays recoverable.
 restore_stash_if_any() {
     if [ "$STASHED" = "1" ]; then
         STASHED=0
-        if git -C "$REPO_ROOT" stash pop >/dev/null 2>&1; then
-            note "restored your stashed working-tree changes"
+        if git -C "$REPO_ROOT" stash apply "$STASH_SHA" >/dev/null 2>&1; then
+            # Re-find the entry's current position right before dropping it.
+            # apply + drop is not atomic like pop, so say so if the drop fails
+            # rather than leaving a stash that would re-apply on a later pop.
+            local entry=""
+            entry="$(git -C "$REPO_ROOT" stash list --format='%gd %H' 2>/dev/null \
+                | awk -v sha="$STASH_SHA" '$2==sha{print $1; exit}')" || true
+            if [ -n "$entry" ] && git -C "$REPO_ROOT" stash drop "$entry" >/dev/null 2>&1; then
+                note "restored your stashed working-tree changes"
+            else
+                warn "Restored your stashed changes, but couldn't drop the stash entry ($STASH_SHA)."
+                warn "Drop it by hand so a later 'git stash pop' doesn't re-apply it: git stash list"
+            fi
         else
             warn "Couldn't auto-restore your stashed changes (likely a conflict)."
-            warn "They're safe — recover with: git -C \"$REPO_ROOT\" stash list / stash pop"
+            warn "They're safe. Recover with: git -C \"$REPO_ROOT\" stash apply $STASH_SHA"
         fi
     fi
+}
+
+# Revert the commit paths (project.yml + .xcodeproj) after a failed or
+# rehearsed bump. Restores TO the pre-ship snapshot, not to HEAD: in include
+# mode the user's own uncommitted edits to project.yml live in these paths,
+# and a plain `git checkout --` would silently discard them.
+# Called from the EXIT trap, so everything it prints goes to stderr and it
+# always returns 0. The snapshot was taken against HEAD, so the reset must be
+# to HEAD as well: a bare `git checkout --` restores from the INDEX, which is
+# the wrong base whenever the user had staged edits. Content is preserved;
+# the staged/unstaged split is not (include mode stages everything anyway).
+restore_commit_paths() {
+    # shellcheck disable=SC2086
+    (cd "$REPO_ROOT" && git checkout HEAD -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+    if [ -n "$PRE_SHIP_PATCH" ] && [ -s "$PRE_SHIP_PATCH" ]; then
+        if git -C "$REPO_ROOT" apply --binary "$PRE_SHIP_PATCH" 2>/dev/null; then
+            note "restored your pre-ship edits to $PUSHBACK_COMMIT_PATHS" >&2
+        else
+            # Keep the only copy of the user's edits somewhere macOS won't reap.
+            local keep="$REPO_ROOT/pushback-preship.patch"
+            mv -f "$PRE_SHIP_PATCH" "$keep" 2>/dev/null || keep="$PRE_SHIP_PATCH"
+            warn "Couldn't re-apply your pre-ship edits to $PUSHBACK_COMMIT_PATHS." >&2
+            warn "They're saved as a patch against HEAD: git -C \"$REPO_ROOT\" apply $keep" >&2
+            PRE_SHIP_PATCH=""
+            return 0
+        fi
+    fi
+    [ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
+    PRE_SHIP_PATCH=""
+    return 0
 }
 
 cleanup_on_failure() {
@@ -314,23 +361,25 @@ cleanup_on_failure() {
         if [ "$VERSION_BUMPED" = "1" ] && [ "$VERSION_BUMP_COMMITTED" = "0" ]; then
             if [ "$UPLOAD_SUCCEEDED" = "1" ]; then
                 # Upload landed in ASC but the commit failed. The build number
-                # is burned — reverting locally would make the next run reuse
+                # is burned; reverting locally would make the next run reuse
                 # it and fail validation. Leave it; tell the user to commit.
                 printf '\n%s\n' "  ${YELLOW}▸${RESET} Upload succeeded but the commit failed." >&2
-                printf '%s\n' "  ${YELLOW}▸${RESET} Version bump LEFT IN PLACE — do NOT revert. Commit + push manually:" >&2
+                printf '%s\n' "  ${YELLOW}▸${RESET} Version bump LEFT IN PLACE. Do NOT revert. Commit + push manually:" >&2
                 printf "      git -C %q add %s && git -C %q commit && git -C %q push origin %s\n" \
                     "$REPO_ROOT" "$PUSHBACK_COMMIT_PATHS" "$REPO_ROOT" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
             else
                 printf '\n%s\n' "  ${YELLOW}▸${RESET} Reverting uncommitted version bump…" >&2
-                # shellcheck disable=SC2086
-                (cd "$REPO_ROOT" && git checkout -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+                restore_commit_paths
             fi
         elif [ "$VERSION_BUMP_COMMITTED" = "1" ] && [ "$PUSHED" = "0" ]; then
-            # Bump committed locally but push failed — nothing to revert, just push.
+            # Bump committed locally but push failed. Nothing to revert, just push.
             printf '\n%s\n' "  ${YELLOW}▸${RESET} Bump committed locally but the push failed. Push manually:" >&2
             printf "      git -C %q push origin %s\n" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
         fi
         restore_stash_if_any
+        # Whatever is left here was never needed (nothing was reverted, so the
+        # user's edits are still in the tree). Don't leave it in $TMPDIR.
+        [ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
         echo >&2
         hr >&2
         printf "  ${RED}${BOLD}✗ pushback failed${RESET}  ${DIM}(exit %d, after %s)${RESET}\n" \
@@ -402,7 +451,7 @@ fi
 
 if [ "$MODE" = "pr" ]; then
     TARGET_BRANCH="main"   # PR squash-merges into main; we ship from there
-    # Shipping a PR means shipping the PR's code — a dirty local tree is junk
+    # Shipping a PR means shipping the PR's code, so a dirty local tree is junk
     # here and would also block the post-merge `git checkout main`.
     if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
         fail "Working tree is dirty, but PR mode ships the PR's code. Commit/stash first, or use --from-main to ship local changes."
@@ -487,12 +536,25 @@ if [ "$MODE" = "main" ] && [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; t
     case "$choice" in
         i|I) INCLUDE_DIRTY=1; info "Including uncommitted changes in this ship." ;;
         s|S)
-            info "Stashing uncommitted changes — shipping committed HEAD only."
-            git -C "$REPO_ROOT" stash push --include-untracked --message "pushback: pre-ship stash" >/dev/null
+            info "Stashing uncommitted changes. Shipping committed HEAD only."
+            stash_msg="pushback: pre-ship stash $(date +%s).$$"
+            git -C "$REPO_ROOT" stash push --include-untracked --message "$stash_msg" >/dev/null
+            STASH_SHA="$(git -C "$REPO_ROOT" stash list --format='%H %gs' \
+                | awk -v msg="$stash_msg" 'index($0, msg){print $1; exit}')"
+            [ -n "$STASH_SHA" ] || fail "Stashed, but couldn't find the stash entry. Recover with: git stash list"
             STASHED=1 ;;
-        a|A) fail "Aborted — nothing shipped." ;;
+        a|A) fail "Aborted. Nothing shipped." ;;
     esac
 fi
+
+# ── Snapshot the user's own state of the commit paths ──────────────
+# Taken now, after the dirty-tree decision, so it holds exactly what the user
+# had in these paths before pushback touched anything: their uncommitted
+# project.yml edits in include mode, nothing in stash mode or on a clean tree.
+# Every later revert restores to this snapshot instead of HEAD.
+PRE_SHIP_PATCH="$(mktemp -t pushback-preship)"
+# shellcheck disable=SC2086
+git -C "$REPO_ROOT" diff --binary HEAD -- $PUSHBACK_COMMIT_PATHS >"$PRE_SHIP_PATCH" 2>/dev/null || true
 
 # ── Behind-upstream check (informational) ──────────────────────────
 # A push after a successful upload that gets rejected is recoverable (the
@@ -501,7 +563,7 @@ if git -C "$REPO_ROOT" rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1; the
     git -C "$REPO_ROOT" fetch --quiet origin "$TARGET_BRANCH" 2>/dev/null || true
     BEHIND="$(git -C "$REPO_ROOT" rev-list --count "HEAD..origin/${TARGET_BRANCH}" 2>/dev/null || echo 0)"
     if [ "${BEHIND:-0}" -gt 0 ]; then
-        warn "Local $TARGET_BRANCH is $BEHIND commit(s) behind origin/$TARGET_BRANCH — the final push may need a manual pull."
+        warn "Local $TARGET_BRANCH is $BEHIND commit(s) behind origin/$TARGET_BRANCH. The final push may need a manual pull."
     fi
 fi
 
@@ -519,7 +581,7 @@ else
 fi
 # The interactive dirty menu already served as the confirmation; don't double-prompt.
 if [ "$DIRTY_MENU_SHOWN" != "1" ]; then
-    confirm "Continue?" || fail "Aborted — nothing shipped."
+    confirm "Continue?" || fail "Aborted. Nothing shipped."
 fi
 
 # ── Step: Verify build ─────────────────────────────────────────────
@@ -535,7 +597,7 @@ run_xcodebuild build \
     -destination "generic/platform=iOS Simulator" \
     -derivedDataPath "$VERIFY_BUILD_DIR" \
     CODE_SIGNING_ALLOWED=NO \
-    || fail "iOS build failed. Fix it before shipping — nothing has been merged or bumped."
+    || fail "iOS build failed. Fix it before shipping. Nothing has been merged or bumped."
 rm -rf "$VERIFY_BUILD_DIR"
 step_done
 
@@ -569,10 +631,10 @@ else
                 --output "$APP_DIR/build/maestro-output.log" \
                 || fail "Maestro smoke failed. Review $APP_DIR/build/maestro-output.log."
         else
-            warn "Could not locate $PUSHBACK_APP_BUNDLE — skipping Maestro (tests passed; ship proceeds)."
+            warn "Could not locate $PUSHBACK_APP_BUNDLE. Skipping Maestro (tests passed; ship proceeds)."
         fi
     elif [ "$DRY_RUN" = "0" ]; then
-        warn "maestro not installed — skipping smoke flows. Install: curl -fsSL https://get.maestro.mobile.dev | bash"
+        warn "maestro not installed. Skipping smoke flows. Install: curl -fsSL https://get.maestro.mobile.dev | bash"
     fi
     rm -rf "$VERIFY_BUILD_DIR"
     step_done
@@ -582,10 +644,10 @@ fi
 
 if [ "$MODE" = "pr" ]; then
     # xcodegen may have touched the committed .xcodeproj during verify. Restore
-    # it so the tree is clean before merge — otherwise the post-merge checkout
-    # would strand the pipeline.
-    # shellcheck disable=SC2086
-    (cd "$REPO_ROOT" && git checkout -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+    # it so the tree is clean before merge; otherwise the post-merge checkout
+    # would strand the pipeline. PR mode requires a clean tree (see the guard
+    # above), so the snapshot is empty and this is a plain restore to HEAD.
+    restore_commit_paths
 
     step "Merge PR #$PR_NUMBER (squash)"
     if [ "$DRY_RUN" = "1" ]; then
@@ -637,7 +699,7 @@ step_done
 
 # ── Step: Export + upload to TestFlight ────────────────────────────
 # ExportOptions.plist sets destination=upload, so this single xcodebuild
-# step packages AND uploads. Do NOT add a follow-up `altool --upload-app` —
+# step packages AND uploads. Do NOT add a follow-up `altool --upload-app`:
 # destination=upload leaves no IPA on disk, so altool would error while the
 # upload has already succeeded.
 
@@ -662,12 +724,12 @@ step_done
 
 step "Commit + push version bump"
 if [ "$DRY_RUN" = "1" ]; then
-    # Stage nothing in a rehearsal — just undo the bump so the tree is clean.
+    # Stage nothing in a rehearsal. Just undo the bump so the tree is back to
+    # exactly what the user had (their own edits included, in include mode).
     note "[dry-run] would commit $NEW_VERSION ($NEW_BUILD) and push origin $TARGET_BRANCH"
     [ "$INCLUDE_DIRTY" = "1" ] && note "[dry-run] would include your uncommitted changes in that commit"
-    note "[dry-run] reverting the version bump to leave a clean tree"
-    # shellcheck disable=SC2086
-    (cd "$REPO_ROOT" && git checkout -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+    note "[dry-run] reverting the version bump"
+    restore_commit_paths
     VERSION_BUMPED=0
     restore_stash_if_any
     step_done
@@ -694,6 +756,7 @@ fi
 # ── Done ───────────────────────────────────────────────────────────
 
 rm -rf "$APP_DIR/build"
+[ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
 
 TOTAL=$((SECONDS - SHIP_START))
 echo
@@ -705,12 +768,12 @@ if [ "$DRY_RUN" = "1" ]; then
 else
     printf "  ${BOLD}${GREEN}✓ Shipped %s (%s)${RESET}  ${DIM}· total %s${RESET}\n" \
         "$NEW_VERSION" "$NEW_BUILD" "$(fmt_duration $TOTAL)"
-    printf '%s\n' "  ${DIM}TestFlight processing — appears in App Store Connect shortly.${RESET}"
+    printf '%s\n' "  ${DIM}TestFlight processing. Appears in App Store Connect shortly.${RESET}"
 fi
 hr
 echo
 
-# Audible notification — handy when the archive runs unattended.
+# Audible notification, handy when the archive runs unattended.
 if [ "$DRY_RUN" = "0" ]; then
     command -v say >/dev/null && say "TestFlight upload complete" &
 fi

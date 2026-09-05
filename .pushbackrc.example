@@ -1,4 +1,4 @@
-# pushback config — copy to `.pushbackrc` in your project and edit.
+# pushback config. Copy to `.pushbackrc` in your project and edit.
 # It's a plain shell file (sourced by pushback), so no YAML parser is needed.
 # In most projects you only need PUSHBACK_SCHEME; everything else derives from
 # it or has a sane default. Pin the rest if you like belt-and-suspenders.
