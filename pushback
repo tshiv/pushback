@@ -172,6 +172,7 @@ TARGET_BRANCH=""
 SIM_UDID=""         # the one simulator the QA gate runs on (see resolve_sim_udid)
 SIM_BOOTED_BY_US=0  # shut it down afterwards only if pushback booted it
 LOCK_HELD=0         # this run owns $LOCK_DIR (see acquire_lock)
+BUMP_BRANCH=""      # detached ships only: branch holding the bump commit until it's pushed
 # The lock lives in the repo's COMMON git dir, so it is shared by every
 # worktree of the repo, which is exactly the scope two ships can collide in.
 LOCK_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)/pushback.lock"
@@ -472,6 +473,9 @@ cleanup_on_failure() {
             # Bump committed locally but push failed. Nothing to revert, just push.
             printf '\n%s\n' "  ${YELLOW}▸${RESET} Bump committed locally but the push failed. Push manually:" >&2
             printf "      git -C %q push origin HEAD:refs/heads/%s\n" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
+            if [ -n "${BUMP_BRANCH:-}" ]; then
+                printf '%s\n' "  ${DIM}    The commit is kept on branch $BUMP_BRANCH, which later ships check. Delete it once pushed.${RESET}" >&2
+            fi
         fi
         restore_stash_if_any
         # Whatever is left here was never needed (nothing was reverted, so the
@@ -521,17 +525,20 @@ build_at() {
 # in App Store Connect. Classic case: a worktree cut from origin/main while
 # local main holds an unpushed bump commit from a previous ship.
 check_build_not_stale() {
-    local here ref b name
-    here="$(read_build | head -1)"
+    local here="${1:-}" ref b name
+    [ -n "$here" ] || here="$(read_build | head -1)"
     [[ "$here" =~ ^[0-9]+$ ]] || return 0   # non-integer builds: can't compare
     git -C "$REPO_ROOT" fetch --quiet origin 2>/dev/null || true
+    # refs/heads/pushback/*: bump commits a detached ship failed to push (see
+    # BUMP_BRANCH). They belong to no other branch, so list them explicitly.
     for ref in "refs/remotes/origin/$TARGET_BRANCH" "refs/heads/$TARGET_BRANCH" \
-               refs/remotes/origin/main refs/heads/main; do
+               refs/remotes/origin/main refs/heads/main \
+               $(git -C "$REPO_ROOT" for-each-ref --format='%(refname)' refs/heads/pushback/); do
         b="$(build_at "$ref")"
         [[ "$b" =~ ^[0-9]+$ ]] || continue
         if [ "$b" -gt "$here" ]; then
             name="${ref#refs/heads/}"; name="${name#refs/remotes/}"
-            fail "Build number is stale: this tree is at build $here, but $name is at $b.
+            fail "${STALE_CONTEXT:-}Build number is stale: this tree is at build $here, but $name is at $b.
   Build $((here + 1)) may already be in App Store Connect, so bumping to it could fail validation.
   Bring this branch up to date with $name first. If $name holds an unpushed
   bump commit from an earlier ship, push it (never discard it: that build is burned)."
@@ -603,6 +610,10 @@ else
 fi
 
 acquire_lock
+
+# Resolve the QA simulator now, so a bad name or a UDID an Xcode update
+# deleted fails in seconds rather than after the multi-minute verify build.
+[ "$SKIP_QA" = "1" ] || SIM_UDID="$(resolve_sim_udid "$PUSHBACK_SIM_DEVICE")"
 
 # ── Banner ─────────────────────────────────────────────────────────
 
@@ -704,8 +715,29 @@ if [ "$MODE" = "main" ] && git -C "$REPO_ROOT" rev-parse --abbrev-ref "@{upstrea
 fi
 
 # From-main ships the tree as it is now, so check its build number before any
-# work. PR mode checks after the merge, against the main it will ship from.
-[ "$MODE" = "main" ] && check_build_not_stale
+# work. PR mode ships from origin/main after the merge, and the merge can't be
+# undone, so check everything knowable about that main BEFORE merging: its
+# build number, and (when main is checked out here rather than in another
+# worktree) that local main can fast-forward to it.
+if [ "$MODE" = "main" ]; then
+    check_build_not_stale
+else
+    MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '
+        /^worktree / { wt = substr($0, 10) }
+        $0 == "branch refs/heads/main" { print wt; exit }')"
+    if [ -n "$MAIN_WT" ] && [ "$(cd "$MAIN_WT" 2>/dev/null && pwd -P)" != "$(cd "$REPO_ROOT" && pwd -P)" ]; then
+        SYNC_DETACHED=1
+    else
+        SYNC_DETACHED=0
+    fi
+    git -C "$REPO_ROOT" fetch --quiet origin main 2>/dev/null || true
+    check_build_not_stale "$(build_at refs/remotes/origin/main)"
+    if [ "$SYNC_DETACHED" = "0" ] && git -C "$REPO_ROOT" rev-parse -q --verify refs/heads/main >/dev/null && \
+       ! git -C "$REPO_ROOT" merge-base --is-ancestor refs/heads/main refs/remotes/origin/main; then
+        fail "Local main has diverged from origin/main (an unpushed bump commit?). Nothing was merged.
+  Reconcile it without discarding any bump commit, then re-run."
+    fi
+fi
 
 # ── Pre-ship confirmation ──────────────────────────────────────────
 
@@ -747,7 +779,6 @@ step "QA suite (unit + Maestro)"
 if [ "$SKIP_QA" = "1" ]; then
     step_skip "--skip-qa"
 else
-    SIM_UDID="$(resolve_sim_udid "$PUSHBACK_SIM_DEVICE")"
     if [ "$DRY_RUN" = "1" ]; then
         note "[dry-run] would boot simulator $SIM_UDID if needed, and shut it down after QA"
     elif ! sim_is_booted "$SIM_UDID"; then
@@ -835,14 +866,6 @@ if [ "$MODE" = "pr" ]; then
     # it; a local main that has diverged (e.g. an unpushed bump commit from an
     # earlier ship) stops the run instead of being merged or reset away.
     step "Sync main"
-    MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '
-        /^worktree / { wt = substr($0, 10) }
-        $0 == "branch refs/heads/main" { print wt; exit }')"
-    if [ -n "$MAIN_WT" ] && [ "$(cd "$MAIN_WT" 2>/dev/null && pwd -P)" != "$(cd "$REPO_ROOT" && pwd -P)" ]; then
-        SYNC_DETACHED=1
-    else
-        SYNC_DETACHED=0
-    fi
     MERGED_NOTE="PR #$PR_NUMBER is merged, but nothing was bumped or uploaded."
     if [ "$DRY_RUN" = "1" ]; then
         if [ "$SYNC_DETACHED" = "1" ]; then
@@ -863,20 +886,24 @@ if [ "$MODE" = "pr" ]; then
             git -C "$REPO_ROOT" merge --quiet --ff-only origin/main \
                 || fail "$MERGED_NOTE Local main has diverged from origin/main (an unpushed bump commit?).
   Reconcile it without discarding any bump commit, then: pushback --from-main"
-            # The squash merge leaves the PR branch unmerged as far as git is
-            # concerned, hence -D. Only when it still points at the PR head we
-            # verified, so no local-only commit can be lost.
-            if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ] && \
-               [ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$CURRENT_BRANCH" 2>/dev/null)" = "$PR_HEAD_SHA" ]; then
-                git -C "$REPO_ROOT" branch --quiet -D "$CURRENT_BRANCH" 2>/dev/null || true
-            fi
+        fi
+        # Either way this checkout has left the PR branch, so delete it. The
+        # squash merge leaves it unmerged as far as git is concerned, hence -D,
+        # but only while it still points at the PR head we verified, so no
+        # local-only commit can be lost. A no-op if another worktree has it out.
+        if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ] && \
+           [ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$CURRENT_BRANCH" 2>/dev/null)" = "$PR_HEAD_SHA" ]; then
+            git -C "$REPO_ROOT" branch --quiet -D "$CURRENT_BRANCH" 2>/dev/null || true
         fi
     fi
     step_done
 
     if [ "$DRY_RUN" = "1" ]; then
-        note "[dry-run] skipping the stale-build check (main wasn't synced)"
+        note "[dry-run] skipping the post-merge stale-build recheck (main wasn't synced)"
     else
+        # Recheck: the pre-merge check covered what was known then, but main
+        # can move during the QA run.
+        STALE_CONTEXT="$MERGED_NOTE "
         check_build_not_stale
     fi
 fi
@@ -959,12 +986,24 @@ Includes uncommitted working-tree changes present at ship time."
         git -C "$REPO_ROOT" add $PUSHBACK_COMMIT_PATHS
         COMMIT_MSG="chore: bump iOS to $NEW_VERSION ($NEW_BUILD)"
     fi
+    if [ "${SYNC_DETACHED:-0}" = "1" ]; then
+        # Put the bump commit on a branch BEFORE the push can fail. On a bare
+        # detached HEAD it would be orphaned by the next checkout and invisible
+        # to check_build_not_stale, so a later ship could reuse this burned
+        # number. Removed again once the push lands.
+        BUMP_BRANCH="pushback/unpushed-bump-$NEW_BUILD"
+        git -C "$REPO_ROOT" checkout --quiet -B "$BUMP_BRANCH"
+    fi
     git -C "$REPO_ROOT" commit --quiet -m "$COMMIT_MSG"
     VERSION_BUMP_COMMITTED=1
-    # HEAD:<branch>, not <branch>: after a PR merge in a worktree, HEAD is a
-    # detached origin/main (see Sync main) and there is no local main to push.
+    # HEAD:<branch>, not <branch>: after a PR merge in a worktree, HEAD is not
+    # main (see Sync main) and there is no local main to push.
     git -C "$REPO_ROOT" push --quiet origin "HEAD:refs/heads/$TARGET_BRANCH"
     PUSHED=1
+    if [ -n "${BUMP_BRANCH:-}" ]; then
+        git -C "$REPO_ROOT" checkout --quiet --detach
+        git -C "$REPO_ROOT" branch --quiet -D "$BUMP_BRANCH"
+    fi
     restore_stash_if_any
     step_done
 fi
