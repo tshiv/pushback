@@ -586,10 +586,10 @@ if [ "$MODE" = "pr" ]; then
     if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
         fail "Working tree is dirty, but PR mode ships the PR's code. Commit/stash first, or use --from-main to ship local changes."
     fi
-    PR_HEAD="$(gh pr view "$PR_NUMBER" --json headRefOid,headRefName \
-        --jq '.headRefOid + " " + .headRefName' 2>/dev/null)" \
+    PR_HEAD="$(gh pr view "$PR_NUMBER" --json headRefOid,headRefName,isCrossRepository \
+        --jq '.headRefOid + " " + .headRefName + " " + (.isCrossRepository | tostring)' 2>/dev/null)" \
         || fail "Could not fetch head SHA for PR #$PR_NUMBER."
-    read -r PR_HEAD_SHA PR_HEAD_REF <<<"$PR_HEAD"
+    read -r PR_HEAD_SHA PR_HEAD_REF PR_CROSS_REPO <<<"$PR_HEAD"
     LOCAL_HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     if [ "$PR_HEAD_SHA" != "$LOCAL_HEAD_SHA" ]; then
         fail "Local HEAD ($LOCAL_HEAD_SHA) ≠ PR #$PR_NUMBER head ($PR_HEAD_SHA).
@@ -811,8 +811,21 @@ if [ "$MODE" = "pr" ]; then
     else
         gh pr merge "$PR_NUMBER" --squash \
             || fail "Failed to merge PR #$PR_NUMBER. Check if it's mergeable."
-        git -C "$REPO_ROOT" push --quiet origin --delete "$PR_HEAD_REF" 2>/dev/null \
-            || note "remote branch $PR_HEAD_REF was already gone"
+        # headRefName is a name in the HEAD repo. For a fork PR that is not
+        # origin, and a fork's head is often literally "main", so deleting it
+        # on origin would delete our main. Only delete a same-repo branch that
+        # isn't main/the target, and only while it still points at the commit
+        # we verified and merged (the lease), so a later push isn't lost.
+        if [ "$PR_CROSS_REPO" != "false" ]; then
+            note "PR head branch lives in a fork; leaving it"
+        elif [ "$PR_HEAD_REF" = "main" ] || [ "$PR_HEAD_REF" = "$TARGET_BRANCH" ]; then
+            note "not deleting origin/$PR_HEAD_REF: it is the branch we ship from"
+        else
+            git -C "$REPO_ROOT" push --quiet \
+                --force-with-lease="refs/heads/$PR_HEAD_REF:$PR_HEAD_SHA" \
+                origin --delete "$PR_HEAD_REF" 2>/dev/null \
+                || note "left origin/$PR_HEAD_REF (already gone, or it moved since the merge)"
+        fi
     fi
     step_done
 
