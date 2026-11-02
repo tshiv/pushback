@@ -5,6 +5,22 @@ All notable changes to `pushback` are documented here. Format based on
 
 ## [Unreleased]
 
+### Added
+- **The QA simulator is shut down after the gate.** Previously the sim that `xcodebuild test` and Maestro used stayed booted after every ship, holding a couple of GB of RAM plus its background processes until you noticed. pushback now boots the sim itself when it isn't already running, and shuts it down as soon as the QA step ends, on success, on failure, and from the EXIT trap (Ctrl-C included). A sim that was already booted when the ship started is left running, since it belongs to you or another session. `PUSHBACK_KEEP_SIM=1` opts out.
+
+- **One ship per repo at a time.** A lock in the repo's common git dir (shared by every worktree) stops a second concurrent `pushback`, which would otherwise bump to the same build number and fail App Store Connect validation after a full archive, and fight the first over the QA simulator. The message names the running pid and checkout; a lock left by a SIGKILLed run is taken over.
+- **Stale build numbers are refused before any work.** Build numbers are global to the app, so pushback now compares the tree's build with `main`, `origin/main` and the target branch, and stops if any is ahead. This catches the worktree-cut-from-`origin/main` case where local `main` holds an unpushed bump from an earlier ship. From-main checks before the build; PR mode checks right after syncing `main`.
+
+### Fixed
+- **PR mode works from a git worktree.** After the merge, pushback ran `git checkout main`, which git refuses when `main` is checked out in another worktree, so the PR was merged and nothing shipped. pushback now fetches `origin/main` and, if `main` lives in another worktree, ships from a detached `origin/main` and pushes the bump with `HEAD:main`. Otherwise it checks out `main` and fast-forwards it; a diverged local `main` stops the run with the PR already merged and nothing bumped, instead of being silently merged by `git pull`. `gh pr merge` no longer gets `--delete-branch` (it switches the local checkout to `main` first, which fails the same way); the remote branch is deleted with `git push --delete`, and the local one only when it still points at the verified PR head.
+- **A failed upload no longer reverts the build number.** If `-exportArchive` exits non-zero after App Store Connect already accepted the binary (a dropped connection while waiting for the verdict), the bump used to be reverted and the next ship reused a burned number. The bump is now kept from the first upload attempt on, with the commands to commit and push it.
+- The version bump is pushed as `HEAD:refs/heads/<branch>`, and the failure hints say the same, so recovery commands work from a detached checkout.
+- From-main mode on a detached HEAD now fails up front instead of after the upload, when there would be no branch to push the bump to.
+- The behind-upstream warning only runs in from-main mode. In PR mode it compared the PR branch with `origin/main` and warned about a gap the sync step closes anyway.
+
+### Changed
+- **`PUSHBACK_SIM_DEVICE` names are resolved to one UDID up front**, and every QA call (xcodebuild, `simctl install`, `maestro --device`) targets that UDID. A name must now match a device exactly; when several runtimes have a device of that name, the newest iOS runtime wins. This removes the last use of the ambient `booted` target, so a name config no longer flakes when two sims are up, and a stale UDID (Xcode updates delete simulators) fails before the build with a pointer to `xcrun simctl list devices available` instead of deep inside `xcodebuild test`.
+
 ## [0.1.1] - 2026-09-05
 
 ### Fixed

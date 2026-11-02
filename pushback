@@ -73,6 +73,9 @@ OPTIONS
 
 ENVIRONMENT
   SKIP_PRE_SHIP_QA=1        Same as --skip-qa.
+  PUSHBACK_KEEP_SIM=1       Leave the QA simulator booted afterwards. By
+                            default pushback shuts it down after the QA gate
+                            (pass or fail) if pushback is what booted it.
   NO_COLOR=1                Disable ANSI color (https://no-color.org/).
 EOF
 }
@@ -131,25 +134,7 @@ fi
 : "${PUSHBACK_ASC_ENV_PREFIX:=APPSTORE_CONNECT_}"
 : "${PUSHBACK_ASC_KEY_DIR:=$HOME/.private_keys}"
 : "${PUSHBACK_COMMIT_PATHS:=${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT_YML} ${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT}/}"
-
-# ── Resolve the simulator selector (name vs UDID) ──────────────────
-# PUSHBACK_SIM_DEVICE may be a name ("iPhone 17") or a UDID. A bare name is a
-# prefix match, so "iPhone 17" also resolves "iPhone 17 Pro"/"Pro Max"/"17e",
-# and duplicate names exist across OS runtimes. When several match, or two are
-# booted, `simctl install booted` and a device-less `maestro test` pick a
-# device nondeterministically and flake the QA gate. A UDID is unambiguous, so
-# when one is given, thread it into xcodebuild (id=), simctl (target the UDID,
-# not the ambient "booted" device), and maestro (--device). Names keep the old
-# behavior.
-if [[ "$PUSHBACK_SIM_DEVICE" =~ ^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$ ]]; then
-    PB_SIM_DESTINATION="platform=iOS Simulator,id=${PUSHBACK_SIM_DEVICE}"
-    PB_SIM_TARGET="$PUSHBACK_SIM_DEVICE"
-    PB_MAESTRO_DEVICE="$PUSHBACK_SIM_DEVICE"
-else
-    PB_SIM_DESTINATION="platform=iOS Simulator,name=${PUSHBACK_SIM_DEVICE},OS=latest"
-    PB_SIM_TARGET="booted"
-    PB_MAESTRO_DEVICE=""
-fi
+: "${PUSHBACK_KEEP_SIM:=0}"
 
 # ── Resolve paths ──────────────────────────────────────────────────
 
@@ -170,8 +155,13 @@ ARCHIVE_BUILD_DIR="$APP_DIR/build/archive"
 
 # ── Pipeline state (read by cleanup_on_failure) ────────────────────
 # A bump that's been uploaded must NEVER be reverted (build number burned).
+# Nor one whose upload was merely attempted: ASC can accept the binary and
+# xcodebuild still exit non-zero (a dropped connection while it waits for the
+# verdict). A skipped build number costs nothing; a reused one fails a whole
+# archive later. So from the first upload attempt on, the bump is kept.
 
 VERSION_BUMPED=0
+UPLOAD_ATTEMPTED=0
 UPLOAD_SUCCEEDED=0
 VERSION_BUMP_COMMITTED=0
 PUSHED=0
@@ -179,6 +169,12 @@ STASHED=0
 STASH_SHA=""        # commit SHA of the pre-ship stash (never trust stack position)
 PRE_SHIP_PATCH=""   # user's own uncommitted edits to the commit paths, restored on revert
 TARGET_BRANCH=""
+SIM_UDID=""         # the one simulator the QA gate runs on (see resolve_sim_udid)
+SIM_BOOTED_BY_US=0  # shut it down afterwards only if pushback booted it
+LOCK_HELD=0         # this run owns $LOCK_DIR (see acquire_lock)
+# The lock lives in the repo's COMMON git dir, so it is shared by every
+# worktree of the repo, which is exactly the scope two ships can collide in.
+LOCK_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)/pushback.lock"
 
 # ── App Store Connect API key ──────────────────────────────────────
 # Source the project's env file if the ASC vars aren't already exported.
@@ -355,18 +351,119 @@ restore_commit_paths() {
     return 0
 }
 
+# ── Simulator lifecycle ────────────────────────────────────────────
+# The QA gate pins ONE simulator by UDID for xcodebuild, simctl and maestro.
+# PUSHBACK_SIM_DEVICE may be a UDID or an exact device name. Names repeat
+# across OS runtimes, and "booted" means whichever sim happens to be up, so a
+# name is resolved once, here, to the newest iOS runtime's device of that name.
+# Every later call then targets the same device deterministically.
+resolve_sim_udid() {
+    local sel=$1 udid=""
+    if [[ "$sel" =~ ^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$ ]]; then
+        udid="$(printf '%s' "$sel" | tr '[:lower:]' '[:upper:]')"
+        xcrun simctl list devices available | grep -q "($udid)" \
+            || fail "Simulator $udid (PUSHBACK_SIM_DEVICE) doesn't exist or its runtime is gone.
+  Xcode updates can delete simulators. Pick a current one: xcrun simctl list devices available"
+    else
+        # Device lines look like "    iPhone 17 Pro (UDID) (Shutdown) ". A name
+        # can itself contain parens ("iPhone 17 Pro (my clone)"), so peel the
+        # state and UDID off the END rather than splitting on "(".
+        udid="$(xcrun simctl list devices available | awk -v want="$sel" '
+            /^-- iOS / { rt = $3; next }
+            /^-- /     { rt = ""; next }
+            rt == ""   { next }
+            {
+                line = $0
+                sub(/^ +/, "", line); sub(/ +$/, "", line)
+                sub(/ \([^()]*\)$/, "", line)           # drop " (State)"
+                id = line; sub(/.* \(/, "", id); sub(/\)$/, "", id)
+                name = line; sub(/ \([^()]*\)$/, "", name)
+                if (name == want) print rt, id
+            }' | sort -t. -k1,1n -k2,2n | tail -1 | cut -d' ' -f2)"
+        [ -n "$udid" ] || fail "No available simulator named \"$sel\" (PUSHBACK_SIM_DEVICE needs an exact name or a UDID).
+  See what exists: xcrun simctl list devices available"
+    fi
+    printf '%s' "$udid"
+}
+
+sim_is_booted() { xcrun simctl list devices | grep "($1)" | grep -q '(Booted)'; }
+
+# Boot and wait until it's usable. bootstatus prints a status line per second;
+# drop those but keep stderr, which spinner_run shows if the boot fails.
+boot_sim() { xcrun simctl bootstatus "$1" -b >/dev/null; }
+
+# Shut the QA simulator down if pushback booted it. A sim that was already
+# running belongs to the user (or another session) and is left alone.
+# Called from the EXIT trap as well, so it prints to stderr and never fails.
+release_sim() {
+    [ "$SIM_BOOTED_BY_US" = "1" ] || return 0
+    SIM_BOOTED_BY_US=0
+    if [ "$PUSHBACK_KEEP_SIM" = "1" ]; then
+        note "left simulator $SIM_UDID booted (PUSHBACK_KEEP_SIM=1)" >&2
+        return 0
+    fi
+    if xcrun simctl shutdown "$SIM_UDID" >/dev/null 2>&1; then
+        note "shut down simulator $SIM_UDID" >&2
+    else
+        warn "Couldn't shut down simulator $SIM_UDID. Stop it with: xcrun simctl shutdown $SIM_UDID" >&2
+    fi
+    return 0
+}
+
+# ── Ship lock ──────────────────────────────────────────────────────
+# Two ships at once (say, from two worktrees) read the same build number,
+# bump to the same N, and the second fails ASC validation after a full
+# archive. They would also share, and fight over, the QA simulator. So one
+# ship per repo at a time. mkdir is atomic; the owner file is for the message.
+acquire_lock() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        local pid="" where=""
+        { read -r pid; read -r where; } <"$LOCK_DIR/owner" 2>/dev/null || true
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            fail "Another pushback (pid $pid, in ${where:-?}) is already shipping from this repo.
+  Two ships at once would claim the same build number. Wait for it to finish.
+  If no pushback is actually running, remove the lock: rm -rf \"$LOCK_DIR\""
+        fi
+        # Left behind by a run that was SIGKILLed (no EXIT trap). Take it over.
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null || fail "Couldn't take the ship lock at $LOCK_DIR."
+    fi
+    LOCK_HELD=1
+    printf '%s\n%s\n' "$$" "$REPO_ROOT" >"$LOCK_DIR/owner"
+}
+
+release_lock() {
+    [ "$LOCK_HELD" = "1" ] || return 0
+    LOCK_HELD=0
+    rm -rf "$LOCK_DIR"
+}
+
+# Print the manual commit + push for a bump that must be kept (burned).
+print_keep_bump_hint() {
+    printf '%s\n' "  ${YELLOW}▸${RESET} Version bump LEFT IN PLACE. Do NOT revert it. Commit + push it manually:" >&2
+    printf "      git -C %q add %s && git -C %q commit -m %q && git -C %q push origin HEAD:refs/heads/%s\n" \
+        "$REPO_ROOT" "$PUSHBACK_COMMIT_PATHS" "$REPO_ROOT" "chore: bump iOS build (burned)" \
+        "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
+}
+
 cleanup_on_failure() {
     local rc=$?
     if [ "$rc" -ne 0 ]; then
+        release_sim
         if [ "$VERSION_BUMPED" = "1" ] && [ "$VERSION_BUMP_COMMITTED" = "0" ]; then
             if [ "$UPLOAD_SUCCEEDED" = "1" ]; then
                 # Upload landed in ASC but the commit failed. The build number
                 # is burned; reverting locally would make the next run reuse
                 # it and fail validation. Leave it; tell the user to commit.
                 printf '\n%s\n' "  ${YELLOW}▸${RESET} Upload succeeded but the commit failed." >&2
-                printf '%s\n' "  ${YELLOW}▸${RESET} Version bump LEFT IN PLACE. Do NOT revert. Commit + push manually:" >&2
-                printf "      git -C %q add %s && git -C %q commit && git -C %q push origin %s\n" \
-                    "$REPO_ROOT" "$PUSHBACK_COMMIT_PATHS" "$REPO_ROOT" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
+                print_keep_bump_hint
+            elif [ "$UPLOAD_ATTEMPTED" = "1" ]; then
+                # The upload reported failure, but ASC may have the build anyway
+                # (see UPLOAD_ATTEMPTED). Treat the number as burned.
+                printf '\n%s\n' "  ${YELLOW}▸${RESET} The upload failed, but App Store Connect may have received the build anyway." >&2
+                printf '%s\n' "  ${YELLOW}▸${RESET} Check TestFlight. Either way the build number may be burned, so it is kept." >&2
+                print_keep_bump_hint
+                printf '%s\n' "  ${DIM}    Then re-run pushback; it bumps past this number.${RESET}" >&2
             else
                 printf '\n%s\n' "  ${YELLOW}▸${RESET} Reverting uncommitted version bump…" >&2
                 restore_commit_paths
@@ -374,7 +471,7 @@ cleanup_on_failure() {
         elif [ "$VERSION_BUMP_COMMITTED" = "1" ] && [ "$PUSHED" = "0" ]; then
             # Bump committed locally but push failed. Nothing to revert, just push.
             printf '\n%s\n' "  ${YELLOW}▸${RESET} Bump committed locally but the push failed. Push manually:" >&2
-            printf "      git -C %q push origin %s\n" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
+            printf "      git -C %q push origin HEAD:refs/heads/%s\n" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
         fi
         restore_stash_if_any
         # Whatever is left here was never needed (nothing was reverted, so the
@@ -387,6 +484,7 @@ cleanup_on_failure() {
         hr >&2
         echo >&2
     fi
+    release_lock
     exit "$rc"
 }
 trap cleanup_on_failure EXIT
@@ -407,6 +505,38 @@ predict_next() {
         major) major=$((major + 1)); minor=0; patch=0 ;;
     esac
     printf '%s.%s.%s (%s)' "$major" "$minor" "$patch" "$((b + 1))"
+}
+
+# Build number recorded at a git ref, or empty if the ref/file doesn't exist.
+# Never fails: under pipefail a missing ref would otherwise kill the run via
+# set -e with no message.
+build_at() {
+    git -C "$REPO_ROOT" show "$1:${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT_YML}" 2>/dev/null \
+        | grep -m1 'CURRENT_PROJECT_VERSION:' | awk '{print $2}' || true
+}
+
+# Refuse to bump from a stale build number. Build numbers are global to the
+# app, not per branch, so if any branch we can see records a higher build than
+# the tree we're about to bump, that number (or one past ours) may already be
+# in App Store Connect. Classic case: a worktree cut from origin/main while
+# local main holds an unpushed bump commit from a previous ship.
+check_build_not_stale() {
+    local here ref b name
+    here="$(read_build | head -1)"
+    [[ "$here" =~ ^[0-9]+$ ]] || return 0   # non-integer builds: can't compare
+    git -C "$REPO_ROOT" fetch --quiet origin 2>/dev/null || true
+    for ref in "refs/remotes/origin/$TARGET_BRANCH" "refs/heads/$TARGET_BRANCH" \
+               refs/remotes/origin/main refs/heads/main; do
+        b="$(build_at "$ref")"
+        [[ "$b" =~ ^[0-9]+$ ]] || continue
+        if [ "$b" -gt "$here" ]; then
+            name="${ref#refs/heads/}"; name="${name#refs/remotes/}"
+            fail "Build number is stale: this tree is at build $here, but $name is at $b.
+  Build $((here + 1)) may already be in App Store Connect, so bumping to it could fail validation.
+  Bring this branch up to date with $name first. If $name holds an unpushed
+  bump commit from an earlier ship, push it (never discard it: that build is burned)."
+        fi
+    done
 }
 
 # ── Preflight ──────────────────────────────────────────────────────
@@ -456,8 +586,10 @@ if [ "$MODE" = "pr" ]; then
     if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
         fail "Working tree is dirty, but PR mode ships the PR's code. Commit/stash first, or use --from-main to ship local changes."
     fi
-    PR_HEAD_SHA="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid' 2>/dev/null)" \
+    PR_HEAD="$(gh pr view "$PR_NUMBER" --json headRefOid,headRefName \
+        --jq '.headRefOid + " " + .headRefName' 2>/dev/null)" \
         || fail "Could not fetch head SHA for PR #$PR_NUMBER."
+    read -r PR_HEAD_SHA PR_HEAD_REF <<<"$PR_HEAD"
     LOCAL_HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     if [ "$PR_HEAD_SHA" != "$LOCAL_HEAD_SHA" ]; then
         fail "Local HEAD ($LOCAL_HEAD_SHA) ≠ PR #$PR_NUMBER head ($PR_HEAD_SHA).
@@ -466,8 +598,11 @@ if [ "$MODE" = "pr" ]; then
     TOTAL_STEPS=8
 else
     TARGET_BRANCH="$CURRENT_BRANCH"
+    [ -n "$TARGET_BRANCH" ] || fail "HEAD is detached, so there's no branch to push the version bump to. Check out a branch first."
     TOTAL_STEPS=6
 fi
+
+acquire_lock
 
 # ── Banner ─────────────────────────────────────────────────────────
 
@@ -558,14 +693,19 @@ git -C "$REPO_ROOT" diff --binary HEAD -- $PUSHBACK_COMMIT_PATHS >"$PRE_SHIP_PAT
 
 # ── Behind-upstream check (informational) ──────────────────────────
 # A push after a successful upload that gets rejected is recoverable (the
-# trap tells you to pull+push), but better to know now.
-if git -C "$REPO_ROOT" rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1; then
+# trap tells you to pull+push), but better to know now. From-main only: in PR
+# mode HEAD is the PR branch, and the Sync main step fast-forwards explicitly.
+if [ "$MODE" = "main" ] && git -C "$REPO_ROOT" rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1; then
     git -C "$REPO_ROOT" fetch --quiet origin "$TARGET_BRANCH" 2>/dev/null || true
     BEHIND="$(git -C "$REPO_ROOT" rev-list --count "HEAD..origin/${TARGET_BRANCH}" 2>/dev/null || echo 0)"
     if [ "${BEHIND:-0}" -gt 0 ]; then
         warn "Local $TARGET_BRANCH is $BEHIND commit(s) behind origin/$TARGET_BRANCH. The final push may need a manual pull."
     fi
 fi
+
+# From-main ships the tree as it is now, so check its build number before any
+# work. PR mode checks after the merge, against the main it will ship from.
+[ "$MODE" = "main" ] && check_build_not_stale
 
 # ── Pre-ship confirmation ──────────────────────────────────────────
 
@@ -607,11 +747,22 @@ step "QA suite (unit + Maestro)"
 if [ "$SKIP_QA" = "1" ]; then
     step_skip "--skip-qa"
 else
+    SIM_UDID="$(resolve_sim_udid "$PUSHBACK_SIM_DEVICE")"
+    if [ "$DRY_RUN" = "1" ]; then
+        note "[dry-run] would boot simulator $SIM_UDID if needed, and shut it down after QA"
+    elif ! sim_is_booted "$SIM_UDID"; then
+        # Boot it ourselves (rather than letting xcodebuild do it) so we know
+        # it's ours to shut down. Set the flag first: a Ctrl-C mid-boot still
+        # leaves a booting sim for the trap to stop.
+        SIM_BOOTED_BY_US=1
+        spinner_run "booting simulator…" boot_sim "$SIM_UDID" \
+            || fail "Couldn't boot simulator $SIM_UDID."
+    fi
     info "Unit + snapshot tests"
     run_xcodebuild test \
         -project "$PROJECT" \
         -scheme "$PUSHBACK_SCHEME" \
-        -destination "$PB_SIM_DESTINATION" \
+        -destination "platform=iOS Simulator,id=$SIM_UDID" \
         -derivedDataPath "$VERIFY_BUILD_DIR" \
         -only-testing:"$PUSHBACK_TEST_TARGET" \
         CODE_SIGN_IDENTITY="" \
@@ -621,12 +772,10 @@ else
     if [ "$DRY_RUN" = "0" ] && command -v maestro >/dev/null 2>&1; then
         info "Maestro smoke flows"
         mkdir -p "$APP_DIR/build"
-        xcrun simctl boot "$PUSHBACK_SIM_DEVICE" 2>/dev/null || true
         APP_PATH="$(find "$VERIFY_BUILD_DIR" -name "$PUSHBACK_APP_BUNDLE" -type d | head -1)"
         if [ -n "$APP_PATH" ]; then
-            xcrun simctl install "$PB_SIM_TARGET" "$APP_PATH"
-            # shellcheck disable=SC2086  # PB_MAESTRO_DEVICE is a UDID (no spaces) or empty
-            maestro ${PB_MAESTRO_DEVICE:+--device $PB_MAESTRO_DEVICE} \
+            xcrun simctl install "$SIM_UDID" "$APP_PATH"
+            maestro --device "$SIM_UDID" \
                 test "$APP_DIR/$PUSHBACK_MAESTRO_DIR/" \
                 --output "$APP_DIR/build/maestro-output.log" \
                 || fail "Maestro smoke failed. Review $APP_DIR/build/maestro-output.log."
@@ -637,6 +786,8 @@ else
         warn "maestro not installed. Skipping smoke flows. Install: curl -fsSL https://get.maestro.mobile.dev | bash"
     fi
     rm -rf "$VERIFY_BUILD_DIR"
+    # Free the sim's RAM/CPU now rather than holding it through the archive.
+    release_sim
     step_done
 fi
 
@@ -649,23 +800,72 @@ if [ "$MODE" = "pr" ]; then
     # above), so the snapshot is empty and this is a plain restore to HEAD.
     restore_commit_paths
 
+    # Merge WITHOUT --delete-branch: that flag also deletes the local branch,
+    # which means gh switching this checkout to main first. In a worktree whose
+    # main is checked out elsewhere, git refuses, and the merge has already
+    # happened. Delete the remote branch ourselves; the local one is handled
+    # in Sync main.
     step "Merge PR #$PR_NUMBER (squash)"
     if [ "$DRY_RUN" = "1" ]; then
-        note "[dry-run] would: gh pr merge $PR_NUMBER --squash --delete-branch"
+        note "[dry-run] would: gh pr merge $PR_NUMBER --squash, then delete origin/$PR_HEAD_REF"
     else
-        gh pr merge "$PR_NUMBER" --squash --delete-branch \
+        gh pr merge "$PR_NUMBER" --squash \
             || fail "Failed to merge PR #$PR_NUMBER. Check if it's mergeable."
+        git -C "$REPO_ROOT" push --quiet origin --delete "$PR_HEAD_REF" 2>/dev/null \
+            || note "remote branch $PR_HEAD_REF was already gone"
     fi
     step_done
 
+    # Ship from a fresh origin/main. If main is checked out in ANOTHER worktree,
+    # git won't check it out here too, so ship from a detached origin/main and
+    # push the bump with HEAD:main. Otherwise check out main and fast-forward
+    # it; a local main that has diverged (e.g. an unpushed bump commit from an
+    # earlier ship) stops the run instead of being merged or reset away.
     step "Sync main"
-    if [ "$DRY_RUN" = "1" ]; then
-        note "[dry-run] would: git checkout main && git pull"
+    MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '
+        /^worktree / { wt = substr($0, 10) }
+        $0 == "branch refs/heads/main" { print wt; exit }')"
+    if [ -n "$MAIN_WT" ] && [ "$(cd "$MAIN_WT" 2>/dev/null && pwd -P)" != "$(cd "$REPO_ROOT" && pwd -P)" ]; then
+        SYNC_DETACHED=1
     else
-        git -C "$REPO_ROOT" checkout main >/dev/null 2>&1
-        git -C "$REPO_ROOT" pull --quiet
+        SYNC_DETACHED=0
+    fi
+    MERGED_NOTE="PR #$PR_NUMBER is merged, but nothing was bumped or uploaded."
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ "$SYNC_DETACHED" = "1" ]; then
+            note "[dry-run] would: git fetch origin main && git checkout --detach origin/main (main is checked out in $MAIN_WT)"
+        else
+            note "[dry-run] would: git fetch origin main && git checkout main && git merge --ff-only origin/main"
+        fi
+    else
+        git -C "$REPO_ROOT" fetch --quiet origin main \
+            || fail "$MERGED_NOTE Fetching origin/main failed. Ship it from main: pushback --from-main"
+        if [ "$SYNC_DETACHED" = "1" ]; then
+            git -C "$REPO_ROOT" checkout --quiet --detach origin/main \
+                || fail "$MERGED_NOTE Couldn't check out origin/main here. Ship it from $MAIN_WT: pushback --from-main"
+            note "main is checked out in $MAIN_WT, so shipping from a detached origin/main here"
+        else
+            git -C "$REPO_ROOT" checkout --quiet main \
+                || fail "$MERGED_NOTE Couldn't check out main. Ship it from main: pushback --from-main"
+            git -C "$REPO_ROOT" merge --quiet --ff-only origin/main \
+                || fail "$MERGED_NOTE Local main has diverged from origin/main (an unpushed bump commit?).
+  Reconcile it without discarding any bump commit, then: pushback --from-main"
+            # The squash merge leaves the PR branch unmerged as far as git is
+            # concerned, hence -D. Only when it still points at the PR head we
+            # verified, so no local-only commit can be lost.
+            if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ] && \
+               [ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$CURRENT_BRANCH" 2>/dev/null)" = "$PR_HEAD_SHA" ]; then
+                git -C "$REPO_ROOT" branch --quiet -D "$CURRENT_BRANCH" 2>/dev/null || true
+            fi
+        fi
     fi
     step_done
+
+    if [ "$DRY_RUN" = "1" ]; then
+        note "[dry-run] skipping the stale-build check (main wasn't synced)"
+    else
+        check_build_not_stale
+    fi
 fi
 
 # ── Step: Bump version ─────────────────────────────────────────────
@@ -704,6 +904,7 @@ step_done
 # upload has already succeeded.
 
 step "Upload to TestFlight"
+[ "$DRY_RUN" = "0" ] && UPLOAD_ATTEMPTED=1
 run_xcodebuild -exportArchive \
     -archivePath "$ARCHIVE_PATH" \
     -exportOptionsPlist "$EXPORT_OPTIONS" \
@@ -747,7 +948,9 @@ Includes uncommitted working-tree changes present at ship time."
     fi
     git -C "$REPO_ROOT" commit --quiet -m "$COMMIT_MSG"
     VERSION_BUMP_COMMITTED=1
-    git -C "$REPO_ROOT" push --quiet origin "$TARGET_BRANCH"
+    # HEAD:<branch>, not <branch>: after a PR merge in a worktree, HEAD is a
+    # detached origin/main (see Sync main) and there is no local main to push.
+    git -C "$REPO_ROOT" push --quiet origin "HEAD:refs/heads/$TARGET_BRANCH"
     PUSHED=1
     restore_stash_if_any
     step_done
@@ -769,6 +972,9 @@ else
     printf "  ${BOLD}${GREEN}✓ Shipped %s (%s)${RESET}  ${DIM}· total %s${RESET}\n" \
         "$NEW_VERSION" "$NEW_BUILD" "$(fmt_duration $TOTAL)"
     printf '%s\n' "  ${DIM}TestFlight processing. Appears in App Store Connect shortly.${RESET}"
+    if [ "${SYNC_DETACHED:-0}" = "1" ]; then
+        printf '%s\n' "  ${DIM}This checkout is now detached at the shipped commit (main lives in $MAIN_WT).${RESET}"
+    fi
 fi
 hr
 echo
