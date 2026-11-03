@@ -139,8 +139,11 @@ pushback [options] [PR_NUMBER]
 
 **PR mode.** There's an open PR for the current branch (or you passed a PR
 number). `pushback` verifies the build on the PR branch, runs QA,
-squash-merges, pulls `main`, then ships. Requires a clean working tree (you're
-shipping the PR's code).
+squash-merges, fast-forwards to `origin/main`, then ships. Requires a clean
+working tree (you're shipping the PR's code). Works from a git worktree too:
+if `main` is checked out in another worktree, it ships from a detached
+`origin/main` and pushes the bump with `HEAD:main`. A local `main` that has
+diverged from `origin/main` stops the run rather than being merged or reset.
 
 **From-main mode.** No open PR; you're on `main` (already merged) or a local
 branch. `pushback` ships the current branch's current state and pushes the
@@ -167,12 +170,24 @@ irreversible archive+upload. `--yes` skips the prompts.
 Once `-exportArchive` succeeds, the bumped build number is **burned** in App
 Store Connect. Reusing it fails validation. So `pushback`'s failure handler:
 
-- reverts the bump if it failed **before** the upload,
-- **leaves the bump in place** and tells you to commit manually if the upload
-  succeeded but the commit/push failed,
+- reverts the bump if it failed **before** the upload was attempted,
+- **leaves the bump in place** and tells you to commit it if the upload failed
+  (App Store Connect may have received the build anyway) or succeeded but the
+  commit/push failed,
 - tells you to just push if the commit landed but the push failed.
 
-It never reverts a burned build number.
+It never reverts a build number that might be burned. A skipped number costs
+nothing; a reused one fails a whole archive later.
+
+Two guards keep it from reaching for a burned number in the first place:
+
+- **One ship per repo at a time.** A lock in the repo's shared git dir stops a
+  second `pushback` (from any worktree) until the first finishes, since both
+  would bump to the same build. A lock left by a killed run is taken over.
+- **Stale-build check.** Before bumping, it compares your build number with
+  `main`, `origin/main` and the target branch. If any of them is ahead (for
+  example, local `main` holds an unpushed bump from an earlier ship), it stops
+  and tells you to bring the branch up to date first.
 
 ### Build artifacts
 
@@ -180,6 +195,12 @@ Every intermediate lives under `<app dir>/build/`: the verify build, the unit
 test run, the archive's DerivedData (`build/archive`), the `.xcarchive`, and the
 export directory. Each is removed as soon as it's no longer needed, and the
 whole `build/` tree is swept on success.
+
+The QA simulator is cleaned up too. If `pushback` booted it, it shuts it down
+as soon as the QA gate finishes (pass or fail, Ctrl-C included), so a booted
+sim isn't left eating RAM through the archive and after. A simulator that was
+already running when you started is yours and is left alone. Set
+`PUSHBACK_KEEP_SIM=1` to keep it up.
 
 Nothing is written to `~/Library/Developer/Xcode/DerivedData`. That matters if
 you ship from git worktrees: Xcode keys its default DerivedData location on the

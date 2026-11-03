@@ -27,12 +27,15 @@ PUSHBACK_SCHEME="MyApp"
 # QA gate (xcodebuild test + optional Maestro). Both auto-skip gracefully.
 # PUSHBACK_TEST_TARGET="MyAppTests"
 # PUSHBACK_MAESTRO_DIR="maestro"
-# Simulator target: a name or a UDID. A name is a prefix match ("iPhone 17"
-# also resolves "iPhone 17 Pro"/"Pro Max"/"17e", and names repeat across OS
-# runtimes), which flakes the gate when several match or two sims are booted.
-# Prefer a UDID (`xcrun simctl list devices`) for a stable, unambiguous target.
+# Simulator target: an exact device name or a UDID. A name is resolved once to
+# the newest iOS runtime's device of that name; a UDID pins one device even
+# across runtimes (`xcrun simctl list devices available`).
 # PUSHBACK_SIM_DEVICE="iPhone 17"
 # PUSHBACK_APP_BUNDLE="MyApp.app"
+# If pushback boots the simulator, it shuts it down again after the QA gate,
+# pass or fail. A sim that was already running is left alone. Set to 1 to
+# leave it booted (e.g. to poke at it after a Maestro failure).
+# PUSHBACK_KEEP_SIM=0
 
 # App Store Connect API key. pushback reads the key id + issuer id from these
 # env vars; if unset, it sources them from PUSHBACK_ASC_ENV_FILE (any line
