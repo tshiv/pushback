@@ -236,3 +236,14 @@ t_success_writes_no_stray_carriage_return() {
     assert_rc 0
     ! grep -q "$(printf '\r')" "$T/out" || die "stray carriage return in non-TTY output"
 }
+
+t_pr_bump_that_does_not_raise_build_says_pr_is_merged() {
+    printf '#!/bin/bash\nexit 0\n' >"$T/repo/ios/bump-version.sh"
+    git -C "$T/repo" commit -qam "no-op bump"; git -C "$T/repo" push -q 2>/dev/null
+    pr_in_repo
+    run_pb
+    assert_fail
+    assert_out "PR #7 is merged, but nothing was bumped or uploaded."
+    assert_out "left the build at '41'"
+    assert_eq "$(uploads)" 0 "uploads"
+}

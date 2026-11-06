@@ -1321,9 +1321,10 @@ NEW_BUILD="$(read_build)"
 # The bump script is the user's. If it didn't raise the build, archiving would
 # upload a number that is already in App Store Connect.
 burned="$(read_burned)"
-if ! [[ "$NEW_BUILD" =~ ^[0-9]+$ ]] || [ "$NEW_BUILD" -le "$OLD_BUILD" ] || \
+if ! [[ "$NEW_BUILD" =~ ^[0-9]+$ ]] || ! [[ "$OLD_BUILD" =~ ^[0-9]+$ ]] || [ "$NEW_BUILD" -le "$OLD_BUILD" ] || \
    { [ -n "$burned" ] && [ "$NEW_BUILD" -le "$burned" ]; }; then
-    fail "$PUSHBACK_BUMP_SCRIPT left the build at '${NEW_BUILD:-?}' (was $OLD_BUILD${burned:+, last uploaded $burned}).
+    # STALE_CONTEXT says so when this lands after a PR merge.
+    fail "${STALE_CONTEXT:-}$PUSHBACK_BUMP_SCRIPT left the build at '${NEW_BUILD:-?}' (was $OLD_BUILD${burned:+, last uploaded $burned}).
   It must raise CURRENT_PROJECT_VERSION in $PROJECT_YML. Nothing was archived or uploaded."
 fi
 info "→ $NEW_VERSION ($NEW_BUILD)"
