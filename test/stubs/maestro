@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "maestro $*" >>"$STUB_LOG"
+[ "${FAKE_MAESTRO_FAIL:-0}" = 1 ] && { echo "flow failed" >&2; exit 1; }
+exit 0

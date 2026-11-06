@@ -1,0 +1,7 @@
+#!/bin/bash
+# Fake xcodegen: mirror project.yml's build number into the .xcodeproj, as the
+# real one would, so bump commits touch both commit paths.
+echo "xcodegen $* ($PWD)" >>"$STUB_LOG"
+b="$(grep -m1 'CURRENT_PROJECT_VERSION:' project.yml | awk '{print $2}')"
+for p in *.xcodeproj; do [ -d "$p" ] && echo "CURRENT_PROJECT_VERSION = $b;" >"$p/project.pbxproj"; done
+exit 0

@@ -13,6 +13,17 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
-        run: shellcheck --shell=bash pushback install.sh
+        run: shellcheck --shell=bash pushback install.sh test/run.sh test/lib.sh test/cases/*.sh test/stubs/*
       - name: Syntax check
         run: bash -n pushback && bash -n install.sh
+
+  # End-to-end runs against stubbed Xcode/simctl/gh and a local git remote.
+  # macOS so pushback runs under the bash 3.2 at /bin/bash that users have.
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash version
+        run: /bin/bash --version | head -1
+      - name: Test suite
+        run: test/run.sh

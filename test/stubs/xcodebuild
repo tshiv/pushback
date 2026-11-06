@@ -1,0 +1,42 @@
+#!/bin/bash
+# Fake xcodebuild. Logs every call; FAKE_* env vars inject failures.
+echo "xcodebuild $*" >>"$STUB_LOG"
+
+arg() {   # value following flag $1 in the original argv
+    local want=$1 prev=""; shift
+    for a in "$@"; do [ "$prev" = "$want" ] && { printf '%s' "$a"; return; }; prev=$a; done
+}
+dd="$(arg -derivedDataPath "$@")"
+
+case "$1" in
+    build)
+        [ "${FAKE_BUILD_FAIL:-0}" = 1 ] && { echo "error: Swift compile failed" >&2; exit 65; }
+        mkdir -p "$dd" ;;
+    test)
+        [ "${FAKE_TEST_FAIL:-0}" = 1 ] && { echo "error: 1 test failed" >&2; exit 65; }
+        [ -n "${FAKE_SIGNAL_ON_TEST:-}" ] && kill "-$FAKE_SIGNAL_ON_TEST" "$PPID"
+        mkdir -p "$dd/Build/Products/Debug-iphonesimulator/${FAKE_APP_BUNDLE:-Demo.app}" ;;
+    archive)
+        mkdir -p "$(arg -archivePath "$@")" "$dd"
+        # A long archive, for tests that act on pushback while it runs. The
+        # marker shows whether this process outlived pushback.
+        if [ -n "${FAKE_SLOW_ARCHIVE:-}" ]; then
+            echo "$PPID" >"$STUB_LOG.pbpid"
+            sleep "$FAKE_SLOW_ARCHIVE"
+            echo finished >"$STUB_LOG.archive_done"
+        fi
+        # Someone else pushes to main while we archive, so our final push is rejected.
+        if [ "${FAKE_MOVE_MAIN:-0}" = 1 ]; then
+            t="$(mktemp -d "$STUB_TMP/xb.XXXXXX")"; git clone -q "$FAKE_REMOTE" "$t/c" && cd "$t/c" \
+                && echo x >other.txt && git add -A && git commit -qm "someone else" && git push -q origin main
+        fi
+        # Ctrl-C (or a kill) arriving mid-archive.
+        [ -n "${FAKE_SIGNAL_ON_ARCHIVE:-}" ] && kill "-$FAKE_SIGNAL_ON_ARCHIVE" "$PPID"
+        [ "${FAKE_ARCHIVE_FAIL:-0}" = 1 ] && { echo "error: signing failed" >&2; exit 65; }
+        ;;
+    -exportArchive)
+        [ -n "${FAKE_SIGNAL_ON_EXPORT:-}" ] && kill "-$FAKE_SIGNAL_ON_EXPORT" "$PPID"
+        [ "${FAKE_EXPORT_FAIL:-0}" = 1 ] && { echo "error: upload connection lost" >&2; exit 70; }
+        echo "upload" >>"$STUB_LOG.uploads" ;;
+esac
+exit 0

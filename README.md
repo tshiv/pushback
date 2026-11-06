@@ -6,6 +6,7 @@ TestFlight from your laptop. No CI, no Ruby, no Fastlane setup tax.
 ```bash
 pushback            # auto-detects: open PR → merge & ship, else ship current branch
 pushback --dry-run  # rehearse the whole thing: no merge, no upload, no push
+pushback doctor     # check everything a ship needs, change nothing
 ```
 
 `pushback` is a single, dependency-light bash script that does the entire
@@ -81,6 +82,7 @@ APPSTORE_CONNECT_API_ISSUER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 Your `ExportOptions.plist` must set `destination=upload` so the single
 `-exportArchive` step both packages *and* uploads (no `altool` follow-up).
+pushback checks this before it builds anything.
 
 ---
 
@@ -101,12 +103,19 @@ PUSHBACK_APP_DIR="ios"
 PUSHBACK_SCHEME="MyApp"
 ```
 
-Then run it (point `--config` at your `.pushbackrc`, or drop a `.pushbackrc`
-next to the binary / in the working directory):
+Then check it, and rehearse a ship (point `--config` at your `.pushbackrc`,
+or drop a `.pushbackrc` next to the binary / in the working directory):
 
 ```bash
+pushback --config ios/.pushbackrc doctor
 pushback --config ios/.pushbackrc --dry-run
 ```
+
+`doctor` lists every problem at once: missing tools, Xcode pointing at the
+Command Line Tools, `gh` not signed in, a missing App Store Connect key, an
+`ExportOptions.plist` that won't upload, a simulator that no longer exists,
+origin unreachable, a stale build number, leftovers from an earlier failed
+ship. It changes nothing apart from a `git fetch`.
 
 A common pattern is a tiny wrapper script checked into your repo:
 
@@ -133,6 +142,8 @@ pushback [options] [PR_NUMBER]
 | `pushback --dry-run` | Run everything reversible; **stub** merge, archive, upload, push; revert the bump. |
 | `pushback --skip-qa` | Skip the unit-test + Maestro gate. |
 | `pushback --yes` | Don't prompt. A dirty tree is included wholesale. |
+| `pushback --dirty stash` | Decide a dirty tree up front: `include`, `stash`, or `abort` (add `--yes` for unattended runs). |
+| `pushback doctor` | Check the toolchain, config, key, simulator and repo state. Ships nothing. |
 | `pushback --config <path>` | Point at a specific `.pushbackrc` (default: `./.pushbackrc`). |
 
 ### Modes
@@ -179,15 +190,21 @@ Store Connect. Reusing it fails validation. So `pushback`'s failure handler:
 It never reverts a build number that might be burned. A skipped number costs
 nothing; a reused one fails a whole archive later.
 
-Two guards keep it from reaching for a burned number in the first place:
+Three guards keep it from reaching for a burned number in the first place:
 
+- **A record of burned numbers.** The moment an upload starts, its build
+  number goes into `.git/pushback.burned` (one file per clone, shared by its
+  worktrees, one line per app). A later ship from that clone won't bump to it again, even if the
+  kept bump was stashed, discarded, or reset away.
 - **One ship per repo at a time.** A lock in the repo's shared git dir stops a
   second `pushback` (from any worktree) until the first finishes, since both
   would bump to the same build. A lock left by a killed run is taken over.
 - **Stale-build check.** Before bumping, it compares your build number with
   `main`, `origin/main` and the target branch. If any of them is ahead (for
   example, local `main` holds an unpushed bump from an earlier ship), it stops
-  and tells you to bring the branch up to date first.
+  and tells you to bring the branch up to date first. That includes
+  `pushback-unpushed-bump-<build>` branches, where a PR ship from a worktree
+  parks its bump commit if the final push is rejected.
 
 ### Build artifacts
 
@@ -202,6 +219,18 @@ sim isn't left eating RAM through the archive and after. A simulator that was
 already running when you started is yours and is left alone. Set
 `PUSHBACK_KEEP_SIM=1` to keep it up.
 
+Give pushback a simulator of its own. If `PUSHBACK_SIM_DEVICE` is unset it
+uses the newest runtime's first iPhone, which is probably the one you (or your
+coding agent) are already using, and then pushback's QA run and your session
+share, boot and shut down the same device. A dedicated one is a single
+command:
+
+```bash
+xcrun simctl create "pushback QA" com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro
+```
+
+Put the UDID it prints in `PUSHBACK_SIM_DEVICE`.
+
 Nothing is written to `~/Library/Developer/Xcode/DerivedData`. That matters if
 you ship from git worktrees: Xcode keys its default DerivedData location on the
 `.xcodeproj` absolute path, so each worktree would otherwise get its own cache
@@ -215,6 +244,22 @@ dies with the checkout.
 `.pushbackrc` is sourced shell. See [`.pushbackrc.example`](.pushbackrc.example)
 for every key. Minimal config needs only `PUSHBACK_SCHEME`; everything else
 derives from it or has a default.
+
+---
+
+## Development
+
+`pushback` is one bash file that has to run on the bash 3.2 macOS ships. The
+test suite runs the real script end to end against stubbed `xcodebuild`,
+`xcrun simctl`, `gh`, `xcodegen` and `maestro`, and a throwaway local git
+remote. Nothing touches Xcode, your simulators, GitHub, or your git config.
+
+```bash
+test/run.sh              # everything (about a minute)
+test/run.sh stash lock   # tests whose names contain "stash" or "lock"
+```
+
+CI runs it on macOS, plus ShellCheck, for every PR.
 
 ---
 

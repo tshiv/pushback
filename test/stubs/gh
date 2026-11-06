@@ -1,0 +1,26 @@
+#!/bin/bash
+# Fake gh. One open PR (#7) whose head is $FAKE_PR_BRANCH on $FAKE_REMOTE,
+# present only when FAKE_PR=1. FAKE_CROSS=true makes it a fork PR.
+echo "gh $*" >>"$STUB_LOG"
+R="$FAKE_REMOTE"; B="${FAKE_PR_BRANCH:-feat}"
+case "$1 $2" in
+    "auth status") [ "${FAKE_GH_UNAUTH:-0}" = 1 ] && { echo "not logged in" >&2; exit 1; }; exit 0 ;;
+    "pr view")
+        [ "${FAKE_GH_UNAUTH:-0}" = 1 ] && { echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4; }
+        [ "${FAKE_PR:-0}" = 1 ] || { echo "no pull requests found for branch \"$3\"" >&2; exit 1; }
+        if [[ "$*" == *headRefOid* ]]; then
+            echo "$(git --git-dir="$R" rev-parse "refs/heads/$B") ${FAKE_HEAD_REF:-$B} ${FAKE_CROSS:-false}"
+        elif [ "$3" = "$B" ] || [ "$3" = 7 ]; then
+            echo 7
+        else
+            echo "no pull requests found for branch \"$3\"" >&2; exit 1
+        fi ;;
+    "pr merge")
+        [[ "$*" == *--delete-branch* ]] && { echo "unexpected --delete-branch" >&2; exit 9; }
+        [ "${FAKE_MERGE_FAIL:-0}" = 1 ] && { echo "not mergeable" >&2; exit 1; }
+        t="$(mktemp -d "$STUB_TMP/gh.XXXXXX")"
+        git clone -q "$R" "$t/c" && cd "$t/c" && git merge -q --squash "origin/$B" >/dev/null \
+            && git commit -qm "squash: PR #7" && git push -q origin main || exit 1
+        echo "merged" >>"$STUB_LOG.merges" ;;
+    *) echo "gh stub: unsupported: $*" >&2; exit 64 ;;
+esac
