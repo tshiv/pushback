@@ -1,0 +1,32 @@
+#!/bin/bash
+# Fake `xcrun simctl`. Devices live in $STUB_SIMS, one per line:
+#   <runtime>|<name>|<udid>|<Booted|Shutdown>
+echo "xcrun $*" >>"$STUB_LOG"
+[ "$1" = simctl ] || { echo "xcrun stub: unsupported: $*" >&2; exit 64; }
+shift
+
+set_state() {
+    awk -F'|' -v OFS='|' -v id="$1" -v st="$2" '$3 == id { $4 = st } { print }' \
+        "$STUB_SIMS" >"$STUB_SIMS.tmp" && mv "$STUB_SIMS.tmp" "$STUB_SIMS"
+}
+exists() { awk -F'|' -v id="$1" '$3 == id { f = 1 } END { exit !f }' "$STUB_SIMS"; }
+
+case "$1" in
+    list)
+        echo "== Devices =="
+        sort -t'|' -k1,1 "$STUB_SIMS" | awk -F'|' '
+            $1 != rt { rt = $1; print "-- iOS " rt " --" }
+            { printf "    %s (%s) (%s) \n", $2, $3, $4 }'
+        ;;
+    bootstatus)
+        exists "$2" || { echo "Invalid device: $2" >&2; exit 148; }
+        [ "${FAKE_BOOT_FAIL:-0}" = 1 ] && { echo "boot failed" >&2; exit 1; }
+        echo "Waiting on <private>"; set_state "$2" Booted ;;
+    shutdown)
+        exists "$2" || { echo "Invalid device: $2" >&2; exit 148; }
+        # A Ctrl-C while pushback's cleanup waits on the shutdown.
+        [ -n "${FAKE_SIGNAL_ON_SHUTDOWN:-}" ] && kill "-$FAKE_SIGNAL_ON_SHUTDOWN" "$PPID"
+        set_state "$2" Shutdown ;;
+    install) exists "$2" || exit 148 ;;
+    *) echo "xcrun stub: unsupported simctl $1" >&2; exit 64 ;;
+esac

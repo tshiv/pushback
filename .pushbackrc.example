@@ -29,8 +29,10 @@ PUSHBACK_SCHEME="MyApp"
 # PUSHBACK_MAESTRO_DIR="maestro"
 # Simulator target: an exact device name or a UDID. A name is resolved once to
 # the newest iOS runtime's device of that name; a UDID pins one device even
-# across runtimes (`xcrun simctl list devices available`).
-# PUSHBACK_SIM_DEVICE="iPhone 17"
+# across runtimes (`xcrun simctl list devices available`). Unset, it's the
+# newest runtime's first iPhone. Best: a simulator only pushback uses, e.g.
+#   xcrun simctl create "pushback QA" com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro
+# PUSHBACK_SIM_DEVICE="iPhone 17 Pro"
 # PUSHBACK_APP_BUNDLE="MyApp.app"
 # If pushback boots the simulator, it shuts it down again after the QA gate,
 # pass or fail. A sim that was already running is left alone. Set to 1 to
@@ -38,8 +40,9 @@ PUSHBACK_SCHEME="MyApp"
 # PUSHBACK_KEEP_SIM=0
 
 # App Store Connect API key. pushback reads the key id + issuer id from these
-# env vars; if unset, it sources them from PUSHBACK_ASC_ENV_FILE (any line
-# starting with PUSHBACK_ASC_ENV_PREFIX is exported). The .p8 must live at
+# env vars; if unset, it reads them from PUSHBACK_ASC_ENV_FILE (any KEY=value
+# line starting with PUSHBACK_ASC_ENV_PREFIX). The file is parsed as data,
+# never executed; an already-exported variable wins. The .p8 must live at
 #   <PUSHBACK_ASC_KEY_DIR>/AuthKey_<keyid>.p8
 # PUSHBACK_ASC_KEY_ID_VAR="APPSTORE_CONNECT_API_KEY_ID"
 # PUSHBACK_ASC_ISSUER_ID_VAR="APPSTORE_CONNECT_API_ISSUER_ID"
@@ -47,5 +50,7 @@ PUSHBACK_SCHEME="MyApp"
 # PUSHBACK_ASC_ENV_PREFIX="APPSTORE_CONNECT_"
 # PUSHBACK_ASC_KEY_DIR="$HOME/.private_keys"
 
-# Files staged for the version-bump commit (relative to repo root).
+# Files staged for the version-bump commit (relative to repo root). A string
+# is split on whitespace; use an array for paths with spaces.
 # PUSHBACK_COMMIT_PATHS="ios/project.yml ios/MyApp.xcodeproj/"
+# PUSHBACK_COMMIT_PATHS=(ios/project.yml "ios/My App.xcodeproj/")

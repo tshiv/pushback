@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-PUSHBACK_VERSION="0.1.1"
+PUSHBACK_VERSION="0.2.0"
 
 # ── Argument parsing ───────────────────────────────────────────────
 
@@ -42,6 +42,8 @@ FORCE_FROM_MAIN=0
 SKIP_QA="${SKIP_PRE_SHIP_QA:-0}"
 ASSUME_YES=0
 DRY_RUN=0
+DOCTOR=0
+DIRTY_CHOICE=""
 CONFIG_PATH=""
 
 print_help() {
@@ -50,6 +52,7 @@ pushback: ship an iOS app to TestFlight in one command.
 
 USAGE
   pushback [options] [PR_NUMBER]
+  pushback doctor [--config <path>]
 
 MODES (auto-detected; override with --from-main)
   PR mode      An open PR exists for the current branch (or PR_NUMBER given):
@@ -58,11 +61,19 @@ MODES (auto-detected; override with --from-main)
                current branch's current state, optionally including
                uncommitted working-tree changes.
 
+COMMANDS
+  doctor                    Check the toolchain, config, App Store Connect
+                            key, simulator and repo state without shipping.
+                            Lists every problem, not just the first.
+
 OPTIONS
   --from-main, --no-merge   Force from-main mode (skip PR detection + merge).
   --skip-qa                 Skip the unit-test + Maestro gate.
   -y, --yes                 Don't prompt. Auto-confirm; a dirty tree is
                             included wholesale (use with care).
+  --dirty <choice>          Decide a dirty tree up front, without the menu:
+                            include, stash, or abort. Overrides --yes's
+                            include-everything default.
   --dry-run                 Run everything reversible (preflight, mode select,
                             dirty prompt, version bump) but STUB the archive,
                             upload, merge, and push. Reverts the bump at the
@@ -80,17 +91,22 @@ ENVIRONMENT
 EOF
 }
 
+need_value() { [ $# -ge 2 ] || { echo "pushback: $1 needs a value" >&2; exit 2; }; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --from-main|--no-merge) FORCE_FROM_MAIN=1 ;;
         --skip-qa)              SKIP_QA=1 ;;
         -y|--yes)               ASSUME_YES=1 ;;
         --dry-run)              DRY_RUN=1 ;;
-        --config)               CONFIG_PATH="${2:-}"; shift ;;
+        --dirty)                need_value "$@"; DIRTY_CHOICE="$2"; shift ;;
+        --dirty=*)              DIRTY_CHOICE="${1#*=}" ;;
+        --config)               need_value "$@"; CONFIG_PATH="$2"; shift ;;
         --config=*)             CONFIG_PATH="${1#*=}" ;;
         -V|--version)           echo "pushback $PUSHBACK_VERSION"; exit 0 ;;
         -h|--help)              print_help; exit 0 ;;
         -*)                     echo "pushback: unknown option '$1'" >&2; print_help >&2; exit 2 ;;
+        doctor)                 DOCTOR=1 ;;
         *)
             if [ -n "$ARG_PR" ]; then
                 echo "pushback: unexpected extra argument '$1'" >&2; exit 2
@@ -100,6 +116,16 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+case "$DIRTY_CHOICE" in
+    ""|include|stash|abort) ;;
+    *) echo "pushback: --dirty takes include, stash, or abort (got '$DIRTY_CHOICE')" >&2; exit 2 ;;
+esac
+# Accept a PR URL too (…/pull/37), as gh does.
+case "$ARG_PR" in */pull/*) ARG_PR="${ARG_PR##*/pull/}"; ARG_PR="${ARG_PR%%[/#?]*}" ;; esac
+if [ -n "$ARG_PR" ] && ! [[ "$ARG_PR" =~ ^[0-9]+$ ]]; then
+    echo "pushback: expected a PR number, got '$ARG_PR'" >&2; exit 2
+fi
 
 # ── Load config ────────────────────────────────────────────────────
 # The config is a plain shell file that sets PUSHBACK_* variables. Sourcing
@@ -126,15 +152,32 @@ fi
 : "${PUSHBACK_BUMP_LEVEL:=patch}"
 : "${PUSHBACK_TEST_TARGET:=${PUSHBACK_SCHEME}Tests}"
 : "${PUSHBACK_MAESTRO_DIR:=maestro}"
-: "${PUSHBACK_SIM_DEVICE:=iPhone 17}"
+# Empty means "the newest iOS runtime's first iPhone", which survives the
+# yearly device-name churn. Pin a dedicated sim's UDID for a stable QA gate.
+: "${PUSHBACK_SIM_DEVICE:=}"
 : "${PUSHBACK_APP_BUNDLE:=${PUSHBACK_SCHEME}.app}"
 : "${PUSHBACK_ASC_KEY_ID_VAR:=APPSTORE_CONNECT_API_KEY_ID}"
 : "${PUSHBACK_ASC_ISSUER_ID_VAR:=APPSTORE_CONNECT_API_ISSUER_ID}"
 : "${PUSHBACK_ASC_ENV_FILE:=.env.local}"
 : "${PUSHBACK_ASC_ENV_PREFIX:=APPSTORE_CONNECT_}"
 : "${PUSHBACK_ASC_KEY_DIR:=$HOME/.private_keys}"
-: "${PUSHBACK_COMMIT_PATHS:=${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT_YML} ${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT}/}"
 : "${PUSHBACK_KEEP_SIM:=0}"
+
+# Files staged for the bump commit. A bash array in the config keeps paths
+# with spaces whole; a plain string is split on whitespace, as before. The
+# default is built as an array, so a "My App.xcodeproj" works out of the box.
+if declare -p PUSHBACK_COMMIT_PATHS 2>/dev/null | grep -q '^declare -a'; then
+    # bash 3.2 calls "${empty[@]}" unbound under set -u, so check first.
+    [ "${#PUSHBACK_COMMIT_PATHS[@]}" -gt 0 ] || { echo "pushback: PUSHBACK_COMMIT_PATHS is empty." >&2; exit 2; }
+    COMMIT_PATHS=("${PUSHBACK_COMMIT_PATHS[@]}")
+elif [ -n "${PUSHBACK_COMMIT_PATHS:-}" ]; then
+    read -r -a COMMIT_PATHS <<<"$PUSHBACK_COMMIT_PATHS"
+else
+    COMMIT_PATHS=("${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT_YML}" "${PUSHBACK_APP_DIR}/${PUSHBACK_PROJECT}/")
+fi
+[ "${#COMMIT_PATHS[@]}" -gt 0 ] || { echo "pushback: PUSHBACK_COMMIT_PATHS is empty." >&2; exit 2; }
+# Shell-quoted, for messages and copy-pasteable recovery commands.
+COMMIT_PATHS_Q="$(printf '%q ' "${COMMIT_PATHS[@]}")"; COMMIT_PATHS_Q="${COMMIT_PATHS_Q% }"
 
 # ── Resolve paths ──────────────────────────────────────────────────
 
@@ -173,21 +216,51 @@ SIM_UDID=""         # the one simulator the QA gate runs on (see resolve_sim_udi
 SIM_BOOTED_BY_US=0  # shut it down afterwards only if pushback booted it
 LOCK_HELD=0         # this run owns $LOCK_DIR (see acquire_lock)
 BUMP_BRANCH=""      # detached ships only: branch holding the bump commit until it's pushed
-# The lock lives in the repo's COMMON git dir, so it is shared by every
-# worktree of the repo, which is exactly the scope two ships can collide in.
-LOCK_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)/pushback.lock"
+ORIGIN_OK=1         # 0 when the preflight fetch failed: remote refs may be out of date
+INCLUDE_DIRTY=0     # from-main: the user's uncommitted changes ship in the bump commit
+# State shared by every worktree of the repo lives in its COMMON git dir,
+# which is exactly the scope two ships can collide in.
+GIT_COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
+LOCK_DIR="$GIT_COMMON_DIR/pushback.lock"
+# Highest build number this clone has ever started uploading, per app (see
+# record_burned). The one record of a burned number that survives a
+# discarded bump, a stash, a reset or a deleted branch. Keyed by the app's
+# project.yml, since two apps in one repo have independent build numbers.
+BURNED_FILE="$GIT_COMMON_DIR/pushback.burned"
+# Normalized, so "ios", "ios/" and "./ios" configs share one record.
+BURNED_KEY="${PUSHBACK_APP_DIR#./}"; BURNED_KEY="${BURNED_KEY%/}"
+[ "$BURNED_KEY" != "." ] || BURNED_KEY=""
+BURNED_KEY="${BURNED_KEY:+$BURNED_KEY/}${PUSHBACK_PROJECT_YML#./}"
 
 # ── App Store Connect API key ──────────────────────────────────────
-# Source the project's env file if the ASC vars aren't already exported.
+# Read the ASC vars from the project's env file if they aren't exported.
+# The file is parsed as KEY=value data, never evaluated, so a value holding
+# $(...) or backticks is just text. An already-exported variable wins.
 
-if [ -z "${!PUSHBACK_ASC_KEY_ID_VAR:-}" ] || [ -z "${!PUSHBACK_ASC_ISSUER_ID_VAR:-}" ]; then
-    ENV_FILE="$REPO_ROOT/$PUSHBACK_ASC_ENV_FILE"
-    if [ -f "$ENV_FILE" ]; then
-        eval "$(grep "^${PUSHBACK_ASC_ENV_PREFIX}" "$ENV_FILE" | sed 's/^/export /')"
-    fi
+load_env_file() {
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#export }"
+        case "$line" in "$PUSHBACK_ASC_ENV_PREFIX"*=*) ;; *) continue ;; esac
+        key="${line%%=*}"; val="${line#*=}"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        case "$val" in
+            \"*)  val="${val#\"}"; val="${val%%\"*}" ;;   # up to the closing quote,
+            \'*)  val="${val#\'}"; val="${val%%\'*}" ;;   # so a trailing comment goes too
+            *)     val="${val%%[[:space:]]#*}"           # unquoted: drop a trailing # comment
+                   val="${val%"${val##*[![:space:]]}"}" ;;  # and trailing whitespace
+        esac
+        [ -n "${!key:-}" ] || export "$key=$val"
+    done <"$1"
+}
+
+ENV_FILE="$REPO_ROOT/$PUSHBACK_ASC_ENV_FILE"
+if { [ -z "${!PUSHBACK_ASC_KEY_ID_VAR:-}" ] || [ -z "${!PUSHBACK_ASC_ISSUER_ID_VAR:-}" ]; } && [ -f "$ENV_FILE" ]; then
+    load_env_file "$ENV_FILE"
 fi
-API_KEY_ID="${!PUSHBACK_ASC_KEY_ID_VAR:?$PUSHBACK_ASC_KEY_ID_VAR not set. Add it to $PUSHBACK_ASC_ENV_FILE or export it}"
-API_ISSUER_ID="${!PUSHBACK_ASC_ISSUER_ID_VAR:?$PUSHBACK_ASC_ISSUER_ID_VAR not set. Add it to $PUSHBACK_ASC_ENV_FILE or export it}"
+API_KEY_ID="${!PUSHBACK_ASC_KEY_ID_VAR:-}"
+API_ISSUER_ID="${!PUSHBACK_ASC_ISSUER_ID_VAR:-}"
 
 # ── Visual helpers ─────────────────────────────────────────────────
 # Honor NO_COLOR (https://no-color.org/) and skip ANSI on a non-TTY stdout.
@@ -218,6 +291,24 @@ warn()  { printf "  ${YELLOW}▸${RESET} %s\n" "$1"; }
 note()  { printf "    ${DIM}%s${RESET}\n" "$1"; }
 fail()  { printf "  ${RED}✗${RESET} %s\n" "$1" >&2; exit 1; }
 
+# Preflight checks report through these. A ship stops at the first problem;
+# `pushback doctor` lists them all and exits non-zero at the end.
+DOCTOR_PROBLEMS=0
+problem() {
+    if [ "$DOCTOR" = "1" ]; then
+        printf "  ${RED}✗${RESET} %s\n" "$1"; DOCTOR_PROBLEMS=$((DOCTOR_PROBLEMS + 1))
+    else
+        fail "$1"
+    fi
+}
+check_ok()   { [ "$DOCTOR" = "0" ] || printf "  ${GREEN}✓${RESET} %s\n" "$1"; }
+check_warn() { [ "$DOCTOR" = "0" ] || printf "  ${YELLOW}▸${RESET} %s\n" "$1"; }
+# check <ok-message> <problem-message> <command...>: a problem unless it succeeds.
+check() {
+    local good=$1 bad=$2; shift 2
+    if "$@" >/dev/null 2>&1; then check_ok "$good"; else problem "$bad"; fi
+}
+
 fmt_duration() {
     local s=$1
     if [ "$s" -lt 60 ]; then printf "%ds" "$s"
@@ -244,22 +335,39 @@ step_skip() {
 # progress. Output is captured and, on failure, printed in full so an error
 # is NEVER masked. Preserves the command's exit code. Falls back to a plain
 # run when stdout isn't a TTY.
+#
+# The command runs in the FOREGROUND and the spinner in the background, not
+# the other way round: a non-interactive bash starts background jobs with
+# SIGINT ignored, so a backgrounded xcodebuild would outlive a Ctrl-C and keep
+# archiving into build/ after pushback had reverted and released the lock.
+SPINNER_PID=""
+stop_spinner() {
+    [ -n "$SPINNER_PID" ] || return 0
+    kill "$SPINNER_PID" 2>/dev/null; wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+    return 0
+}
+
 spinner_run() {
     local label=$1; shift
     if [ ! -t 1 ]; then "$@"; return $?; fi
     local log; log="$(mktemp -t pushback)"
-    "$@" >"$log" 2>&1 &
-    local pid=$! rc=0 i=0
+    local rc=0 parent=$$
     # Indexed array (not a string slice): bash 3.2 substring-slices by BYTE, which
     # would split these 3-byte braille glyphs into mojibake. Array elements stay whole.
     local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
     local n=${#frames[@]}
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${CYAN}%s${RESET} ${DIM}%s${RESET}" "${frames[$((i % n))]}" "$label"
-        i=$((i + 1))
-        sleep 0.1
-    done
-    if wait "$pid"; then rc=0; else rc=$?; fi
+    (
+        i=0
+        while kill -0 "$parent" 2>/dev/null; do   # never outlive pushback
+            printf "\r  ${CYAN}%s${RESET} ${DIM}%s${RESET}" "${frames[$((i % n))]}" "$label"
+            i=$((i + 1))
+            sleep 0.1
+        done
+    ) &
+    SPINNER_PID=$!
+    "$@" >"$log" 2>&1 || rc=$?
+    stop_spinner
     printf "\r\033[K"
     if [ "$rc" -ne 0 ]; then sed 's/^/    /' "$log" >&2; fi
     rm -f "$log"
@@ -301,8 +409,10 @@ confirm() {
 # stash on conflict, so the user's work stays recoverable.
 restore_stash_if_any() {
     if [ "$STASHED" = "1" ]; then
-        STASHED=0
+        # STASHED is cleared only once the apply has run, so a signal mid-apply
+        # still leaves the EXIT trap something to restore (or report).
         if git -C "$REPO_ROOT" stash apply "$STASH_SHA" >/dev/null 2>&1; then
+            STASHED=0
             # Re-find the entry's current position right before dropping it.
             # apply + drop is not atomic like pop, so say so if the drop fails
             # rather than leaving a stash that would re-apply on a later pop.
@@ -316,6 +426,7 @@ restore_stash_if_any() {
                 warn "Drop it by hand so a later 'git stash pop' doesn't re-apply it: git stash list"
             fi
         else
+            STASHED=0
             warn "Couldn't auto-restore your stashed changes (likely a conflict)."
             warn "They're safe. Recover with: git -C \"$REPO_ROOT\" stash apply $STASH_SHA"
         fi
@@ -332,16 +443,20 @@ restore_stash_if_any() {
 # the wrong base whenever the user had staged edits. Content is preserved;
 # the staged/unstaged split is not (include mode stages everything anyway).
 restore_commit_paths() {
-    # shellcheck disable=SC2086
-    (cd "$REPO_ROOT" && git checkout HEAD -- $PUSHBACK_COMMIT_PATHS 2>/dev/null) || true
+    # One path at a time: a single path missing from HEAD (a gitignored,
+    # generated .xcodeproj) makes a combined checkout restore nothing at all.
+    local path
+    for path in "${COMMIT_PATHS[@]}"; do
+        (cd "$REPO_ROOT" && git checkout HEAD -- "$path" 2>/dev/null) || true
+    done
     if [ -n "$PRE_SHIP_PATCH" ] && [ -s "$PRE_SHIP_PATCH" ]; then
         if git -C "$REPO_ROOT" apply --binary "$PRE_SHIP_PATCH" 2>/dev/null; then
-            note "restored your pre-ship edits to $PUSHBACK_COMMIT_PATHS" >&2
+            note "restored your pre-ship edits to $COMMIT_PATHS_Q" >&2
         else
             # Keep the only copy of the user's edits somewhere macOS won't reap.
             local keep="$REPO_ROOT/pushback-preship.patch"
             mv -f "$PRE_SHIP_PATCH" "$keep" 2>/dev/null || keep="$PRE_SHIP_PATCH"
-            warn "Couldn't re-apply your pre-ship edits to $PUSHBACK_COMMIT_PATHS." >&2
+            warn "Couldn't re-apply your pre-ship edits to $COMMIT_PATHS_Q." >&2
             warn "They're saved as a patch against HEAD: git -C \"$REPO_ROOT\" apply $keep" >&2
             PRE_SHIP_PATCH=""
             return 0
@@ -357,35 +472,52 @@ restore_commit_paths() {
 # PUSHBACK_SIM_DEVICE may be a UDID or an exact device name. Names repeat
 # across OS runtimes, and "booted" means whichever sim happens to be up, so a
 # name is resolved once, here, to the newest iOS runtime's device of that name.
-# Every later call then targets the same device deterministically.
+# Every later call then targets the same device deterministically. Unset
+# means the newest runtime's first iPhone by name, so the default never names
+# a device that a new Xcode has dropped.
+#
+# Device lines look like "    iPhone 17 Pro (UDID) (Shutdown) ". A name can
+# itself contain parens ("iPhone 17 Pro (my clone)"), so the state and UDID
+# are peeled off the END rather than split on "(". Prints
+# "sortkey|runtime|name|udid"; the key orders 18.10 after 18.2.
+list_ios_sims() {
+    xcrun simctl list devices available | awk '
+        /^-- iOS / { rt = $3; split(rt, v, "."); key = sprintf("%04d.%04d", v[1], v[2]); next }
+        /^-- /     { rt = ""; next }
+        rt == ""   { next }
+        {
+            line = $0
+            sub(/^ +/, "", line); sub(/ +$/, "", line)
+            sub(/ \([^()]*\)$/, "", line)           # drop " (State)"
+            id = line; sub(/.* \(/, "", id); sub(/\)$/, "", id)
+            name = line; sub(/ \([^()]*\)$/, "", name)
+            print key "|" rt "|" name "|" id
+        }'
+}
+
 resolve_sim_udid() {
     local sel=$1 udid=""
     if [[ "$sel" =~ ^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$ ]]; then
         udid="$(printf '%s' "$sel" | tr '[:lower:]' '[:upper:]')"
-        xcrun simctl list devices available | grep -q "($udid)" \
+        list_ios_sims | grep -q "|$udid\$" \
             || fail "Simulator $udid (PUSHBACK_SIM_DEVICE) doesn't exist or its runtime is gone.
   Xcode updates can delete simulators. Pick a current one: xcrun simctl list devices available"
+    elif [ -z "$sel" ]; then
+        # Newest runtime first, then name, so the pick is stable between runs.
+        udid="$(list_ios_sims | awk -F'|' '$3 ~ /^iPhone/' \
+            | sort -t'|' -k1,1r -k3,3 | head -1 | cut -d'|' -f4)"
+        [ -n "$udid" ] || fail "No iPhone simulator is available for the QA gate.
+  Create one in Xcode (Window → Devices and Simulators), or set PUSHBACK_SIM_DEVICE."
     else
-        # Device lines look like "    iPhone 17 Pro (UDID) (Shutdown) ". A name
-        # can itself contain parens ("iPhone 17 Pro (my clone)"), so peel the
-        # state and UDID off the END rather than splitting on "(".
-        udid="$(xcrun simctl list devices available | awk -v want="$sel" '
-            /^-- iOS / { rt = $3; next }
-            /^-- /     { rt = ""; next }
-            rt == ""   { next }
-            {
-                line = $0
-                sub(/^ +/, "", line); sub(/ +$/, "", line)
-                sub(/ \([^()]*\)$/, "", line)           # drop " (State)"
-                id = line; sub(/.* \(/, "", id); sub(/\)$/, "", id)
-                name = line; sub(/ \([^()]*\)$/, "", name)
-                if (name == want) print rt, id
-            }' | sort -t. -k1,1n -k2,2n | tail -1 | cut -d' ' -f2)"
+        udid="$(list_ios_sims | awk -F'|' -v want="$sel" '$3 == want' \
+            | sort -t'|' -k1,1r | head -1 | cut -d'|' -f4)"
         [ -n "$udid" ] || fail "No available simulator named \"$sel\" (PUSHBACK_SIM_DEVICE needs an exact name or a UDID).
   See what exists: xcrun simctl list devices available"
     fi
     printf '%s' "$udid"
 }
+
+sim_label() { list_ios_sims | awk -F'|' -v id="$1" '$4 == id { print $3 " (iOS " $2 ")"; exit }'; }
 
 sim_is_booted() { xcrun simctl list devices | grep "($1)" | grep -q '(Booted)'; }
 
@@ -415,19 +547,47 @@ release_sim() {
 # Two ships at once (say, from two worktrees) read the same build number,
 # bump to the same N, and the second fails ASC validation after a full
 # archive. They would also share, and fight over, the QA simulator. So one
-# ship per repo at a time. mkdir is atomic; the owner file is for the message.
+# ship per repo at a time. mkdir is atomic; the owner file names the holder.
+lock_owner() {   # lock_owner <dir>: prints "pid where", empty if unreadable
+    local pid="" where=""
+    [ -f "$1/owner" ] && { read -r pid; read -r where; } <"$1/owner"
+    printf '%s %s' "$pid" "$where"
+    return 0
+}
+
+# Alive, including a process we may not signal (another user's, or one
+# outside a sandbox): kill -0 fails with EPERM for those, but ps still sees them.
+pid_alive() { kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1; }
+
 acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        local pid="" where=""
-        { read -r pid; read -r where; } <"$LOCK_DIR/owner" 2>/dev/null || true
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            fail "Another pushback (pid $pid, in ${where:-?}) is already shipping from this repo.
-  Two ships at once would claim the same build number. Wait for it to finish.
+        local pid where aside="$LOCK_DIR.stale.$$"
+        read -r pid where <<<"$(lock_owner "$LOCK_DIR")"
+        local busy="Two ships at once would claim the same build number. Wait for it to finish.
   If no pushback is actually running, remove the lock: rm -rf \"$LOCK_DIR\""
+        if [ -n "$pid" ] && pid_alive "$pid"; then
+            fail "Another pushback (pid $pid, in ${where:-?}) is already shipping from this repo.
+  $busy"
         fi
-        # Left behind by a run that was SIGKILLed (no EXIT trap). Take it over.
-        rm -rf "$LOCK_DIR"
-        mkdir "$LOCK_DIR" 2>/dev/null || fail "Couldn't take the ship lock at $LOCK_DIR."
+        # No owner yet and the lock is fresh: another run is between its mkdir
+        # and its owner write. That's a live lock, not a stale one.
+        if [ -z "$pid" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin -1 2>/dev/null)" ]; then
+            fail "Another pushback is starting up in this repo.
+  $busy"
+        fi
+        # Stale: left by a run that was SIGKILLed (no EXIT trap). Rename it
+        # aside rather than rm it in place, so that of two runs taking over at
+        # once only one wins. If what we renamed isn't the stale lock we just
+        # read, a racing run had already replaced it: put it back and stop.
+        mv "$LOCK_DIR" "$aside" 2>/dev/null \
+            || fail "Another pushback just took the ship lock in this repo. $busy"
+        if [ "$(lock_owner "$aside")" != "$pid ${where:-}" ]; then
+            mv "$aside" "$LOCK_DIR" 2>/dev/null || true
+            fail "Another pushback just took the ship lock in this repo. $busy"
+        fi
+        rm -rf "$aside"
+        mkdir "$LOCK_DIR" 2>/dev/null \
+            || fail "Another pushback just took the ship lock in this repo. $busy"
     fi
     LOCK_HELD=1
     printf '%s\n%s\n' "$$" "$REPO_ROOT" >"$LOCK_DIR/owner"
@@ -436,21 +596,63 @@ acquire_lock() {
 release_lock() {
     [ "$LOCK_HELD" = "1" ] || return 0
     LOCK_HELD=0
-    rm -rf "$LOCK_DIR"
+    local pid=""   # read directly, not via $(...): this runs in the EXIT trap
+    [ -f "$LOCK_DIR/owner" ] && read -r pid <"$LOCK_DIR/owner"
+    # Ours, or ownerless (we were stopped between mkdir and the owner write).
+    # Never remove a lock another run took.
+    if [ "$pid" = "$$" ] || [ -z "$pid" ]; then rm -rf "$LOCK_DIR"; fi
+    return 0
 }
 
-# Print the manual commit + push for a bump that must be kept (burned).
+# ── Burned build numbers ───────────────────────────────────────────
+# From the first upload attempt on, a build number may be in App Store Connect
+# for good. Record the highest such number per clone, so no later ship from
+# this clone bumps to it again however the bump itself was lost.
+# The file holds one "<app dir>/<project.yml><TAB><build>" line per app.
+read_burned() {
+    [ -f "$BURNED_FILE" ] || return 0
+    awk -F'\t' -v k="$BURNED_KEY" '$1 == k && $2 ~ /^[0-9]+$/ { b = $2 } END { if (b != "") print b }' "$BURNED_FILE"
+}
+
+record_burned() {
+    local b=$1 cur; cur="$(read_burned)"
+    [[ "$b" =~ ^[0-9]+$ ]] || return 0
+    [ -n "$cur" ] && [ "$cur" -ge "$b" ] && return 0
+    {
+        [ ! -f "$BURNED_FILE" ] || awk -F'\t' -v k="$BURNED_KEY" '$1 != k' "$BURNED_FILE"
+        printf '%s\t%s\n' "$BURNED_KEY" "$b"
+    } >"$BURNED_FILE.tmp.$$" && mv -f "$BURNED_FILE.tmp.$$" "$BURNED_FILE"
+}
+
+# Print the manual commit + push for a bump that must be kept (burned). In
+# include mode the shipped build also contained the user's other uncommitted
+# changes, so the commit should too.
 print_keep_bump_hint() {
+    local add msg="chore: bump iOS to ${NEW_VERSION:-?} (${NEW_BUILD:-?})"
+    if [ "$INCLUDE_DIRTY" = "1" ]; then add="-A"; else add="$COMMIT_PATHS_Q"; fi
     printf '%s\n' "  ${YELLOW}▸${RESET} Version bump LEFT IN PLACE. Do NOT revert it. Commit + push it manually:" >&2
     printf "      git -C %q add %s && git -C %q commit -m %q && git -C %q push origin HEAD:refs/heads/%s\n" \
-        "$REPO_ROOT" "$PUSHBACK_COMMIT_PATHS" "$REPO_ROOT" "chore: bump iOS build (burned)" \
-        "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
+        "$REPO_ROOT" "$add" "$REPO_ROOT" "$msg" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
 }
 
 cleanup_on_failure() {
     local rc=$?
-    if [ "$rc" -ne 0 ]; then
-        release_sim
+    # Finish the cleanup whatever happens from here on. A second Ctrl-C would
+    # otherwise end it half done, and after a terminal closes every write to
+    # it fails (EIO), which under set -e would abort it at the first message,
+    # leaving the bump, the stash and the lock behind.
+    set +e
+    trap '' INT TERM HUP PIPE
+    # If the terminal is gone, stop talking to it. Writes to it fail, and bash
+    # keeps the bytes it couldn't write buffered, then flushes them into the
+    # next $(...) that prints: the cleanup would read its own messages back as
+    # data (a lock owner, a stash entry) and act on garbage. Probe with an
+    # external command, which bypasses that buffer.
+    if [ "$rc" -ne 0 ] && ! printf '\r' | cat >&2 2>/dev/null; then
+        exec >/dev/null 2>&1
+    fi
+    stop_spinner
+    if [ "$rc" -ne 0 ] && [ "$DOCTOR" = "0" ]; then
         if [ "$VERSION_BUMPED" = "1" ] && [ "$VERSION_BUMP_COMMITTED" = "0" ]; then
             if [ "$UPLOAD_SUCCEEDED" = "1" ]; then
                 # Upload landed in ASC but the commit failed. The build number
@@ -474,10 +676,18 @@ cleanup_on_failure() {
             printf '\n%s\n' "  ${YELLOW}▸${RESET} Bump committed locally but the push failed. Push manually:" >&2
             printf "      git -C %q push origin HEAD:refs/heads/%s\n" "$REPO_ROOT" "${TARGET_BRANCH:-main}" >&2
             if [ -n "${BUMP_BRANCH:-}" ]; then
-                printf '%s\n' "  ${DIM}    The commit is kept on branch $BUMP_BRANCH, which later ships check. Delete it once pushed.${RESET}" >&2
+                printf '%s\n' "  ${DIM}    The commit is kept on branch $BUMP_BRANCH (checked out here). Don't ship from it.${RESET}" >&2
+                printf '%s\n' "  ${DIM}    Once it's pushed, clean up:${RESET}" >&2
+                printf "      git -C %q checkout --detach && git -C %q branch -D %s\n" "$REPO_ROOT" "$REPO_ROOT" "$BUMP_BRANCH" >&2
             fi
         fi
         restore_stash_if_any
+        # The tree and the stash are safe now. Free the lock, and let signals
+        # through again, before the one step that can hang: a wedged
+        # CoreSimulator must not hold the lock or swallow Ctrl-C.
+        release_lock
+        trap - INT TERM HUP
+        release_sim
         # Whatever is left here was never needed (nothing was reverted, so the
         # user's edits are still in the tree). Don't leave it in $TMPDIR.
         [ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
@@ -492,11 +702,28 @@ cleanup_on_failure() {
     exit "$rc"
 }
 trap cleanup_on_failure EXIT
+# Turn signals into a plain non-zero exit. Without these, bash 3.2 runs the
+# EXIT trap with $? still holding the last command's status (often 0) when a
+# TERM or HUP lands while it waits on a child, so cleanup would take a
+# terminal closed mid-archive for a success and leave the bump in the tree.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 141' PIPE
+
+# Remove only what pushback itself puts under build/, never the directory
+# wholesale: a repo may track files there, and include mode's `git add -A`
+# would commit their deletion.
+remove_build_artifacts() {
+    rm -rf "$VERIFY_BUILD_DIR" "$ARCHIVE_BUILD_DIR" "$ARCHIVE_PATH" "$EXPORT_DIR" "$APP_DIR/build/maestro-output.log"
+    rmdir "$APP_DIR/build" 2>/dev/null || true
+}
 
 # ── Version helpers ────────────────────────────────────────────────
 
-read_version() { grep 'MARKETING_VERSION:' "$PROJECT_YML" | sed 's/.*"\(.*\)"/\1/'; }
-read_build()   { grep 'CURRENT_PROJECT_VERSION:' "$PROJECT_YML" | awk '{print $2}'; }
+# Empty (not a set -e exit) when the field is missing, so callers can say so.
+read_version() { grep 'MARKETING_VERSION:' "$PROJECT_YML" 2>/dev/null | sed 's/.*"\(.*\)"/\1/' || true; }
+read_build()   { grep 'CURRENT_PROJECT_VERSION:' "$PROJECT_YML" 2>/dev/null | awk '{print $2}' || true; }
 
 # Predict what bump-version.sh will produce, for the pre-ship summary only.
 predict_next() {
@@ -519,56 +746,203 @@ build_at() {
         | grep -m1 'CURRENT_PROJECT_VERSION:' | awk '{print $2}' || true
 }
 
+# Branches holding a bump commit that a detached ship uploaded but couldn't
+# push (see BUMP_BRANCH). Flat names, so a branch called "pushback" can't
+# block them; pushback/unpushed-bump-* is the 0.1.x-era spelling.
+bump_branches() {
+    git -C "$REPO_ROOT" for-each-ref --format='%(refname)' \
+        'refs/heads/pushback-unpushed-bump-*' 'refs/heads/pushback/unpushed-bump-*'
+}
+# The branch the bump was meant for, recorded when the bump branch was made.
+bump_target() { git -C "$REPO_ROOT" config --get "branch.$1.pushbackTarget" 2>/dev/null || echo main; }
+is_bump_branch() { case "$1" in pushback-unpushed-bump-*|pushback/unpushed-bump-*) return 0 ;; esac; return 1; }
+
+# One fetch of origin up front, so every build-number check below reads
+# current remote refs. Offline isn't fatal for from-main (it warns), but PR
+# mode can't merge or sync without origin, so it stops before doing anything.
+refresh_origin() {
+    if git -C "$REPO_ROOT" fetch --quiet origin 2>/dev/null; then ORIGIN_OK=1; return 0; fi
+    ORIGIN_OK=0
+    return 1
+}
+
 # Refuse to bump from a stale build number. Build numbers are global to the
 # app, not per branch, so if any branch we can see records a higher build than
 # the tree we're about to bump, that number (or one past ours) may already be
 # in App Store Connect. Classic case: a worktree cut from origin/main while
-# local main holds an unpushed bump commit from a previous ship.
+# local main holds an unpushed bump commit from a previous ship. The burned
+# record covers what no branch shows any more (a discarded or stashed bump).
+# check_build_not_stale [build] [label]: defaults to this tree's build.
 check_build_not_stale() {
-    local here="${1:-}" ref b name
+    local here="${1:-}" label="${2:-this tree}" ref b name burned
     [ -n "$here" ] || here="$(read_build | head -1)"
     [[ "$here" =~ ^[0-9]+$ ]] || return 0   # non-integer builds: can't compare
-    git -C "$REPO_ROOT" fetch --quiet origin 2>/dev/null || true
-    # refs/heads/pushback/*: bump commits a detached ship failed to push (see
-    # BUMP_BRANCH). They belong to no other branch, so list them explicitly.
+    local offline=""
+    [ "$ORIGIN_OK" = "1" ] || offline="
+  (origin was unreachable, so remote branches were compared as last fetched.)"
+    burned="$(read_burned)"
+    if [ -n "$burned" ] && [ "$burned" -gt "$here" ]; then
+        problem "${STALE_CONTEXT:-}Build $burned was already sent to App Store Connect from this clone, but $label is at build $here.
+  Bumping to $((here + 1)) would reuse a number that may be burned.
+  If the kept bump from that ship is still uncommitted (or stashed), commit it and push it.
+  Otherwise set CURRENT_PROJECT_VERSION to $burned in $PROJECT_YML, commit, and re-run.
+  (Recorded in $BURNED_FILE.)"
+        return 0
+    fi
     for ref in "refs/remotes/origin/$TARGET_BRANCH" "refs/heads/$TARGET_BRANCH" \
-               refs/remotes/origin/main refs/heads/main \
-               $(git -C "$REPO_ROOT" for-each-ref --format='%(refname)' refs/heads/pushback/); do
+               refs/remotes/origin/main refs/heads/main $(bump_branches); do
         b="$(build_at "$ref")"
         [[ "$b" =~ ^[0-9]+$ ]] || continue
         if [ "$b" -gt "$here" ]; then
             name="${ref#refs/heads/}"; name="${name#refs/remotes/}"
-            fail "${STALE_CONTEXT:-}Build number is stale: this tree is at build $here, but $name is at $b.
+            problem "${STALE_CONTEXT:-}Build number is stale: $label is at build $here, but $name is at $b.
   Build $((here + 1)) may already be in App Store Connect, so bumping to it could fail validation.
-  Bring this branch up to date with $name first. If $name holds an unpushed
-  bump commit from an earlier ship, push it (never discard it: that build is burned)."
+  Bring it up to date with $name first. If $name holds an unpushed
+  bump commit from an earlier ship, push it (never discard it: that build is burned).$offline"
+            return 0
         fi
     done
+    check_ok "build $here is current (no branch or earlier upload from this clone is ahead)"
 }
 
 # ── Preflight ──────────────────────────────────────────────────────
+# Everything that can be checked in seconds is checked here, before the
+# multi-minute build and long before the merge: a ship that dies after the
+# PR merged, or after the archive, costs far more than one that never starts.
 
-command -v git >/dev/null       || fail "git not found."
-command -v gh >/dev/null        || fail "gh CLI not found. Install: brew install gh"
-command -v xcodegen >/dev/null  || fail "xcodegen not found. Install: brew install xcodegen"
-command -v xcodebuild >/dev/null || fail "xcodebuild not found. Fix: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
-
-XCODE_PATH="$(xcode-select -p 2>/dev/null || true)"
-case "$XCODE_PATH" in
-    */CommandLineTools*)
-        fail "xcode-select points at CommandLineTools, not Xcode.app.
+preflight() {
+    check "gh found" "gh CLI not found. Install: brew install gh" command -v gh
+    check "xcodegen found" "xcodegen not found. Install: brew install xcodegen" command -v xcodegen
+    if command -v xcodebuild >/dev/null; then
+        case "$(xcode-select -p 2>/dev/null || true)" in
+            */CommandLineTools*)
+                problem "xcode-select points at CommandLineTools, not Xcode.app.
   Fix: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" ;;
-esac
+            *) check_ok "Xcode at $(xcode-select -p 2>/dev/null)" ;;
+        esac
+    else
+        problem "xcodebuild not found. Fix: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    fi
 
-API_KEY_FILE="$PUSHBACK_ASC_KEY_DIR/AuthKey_${API_KEY_ID}.p8"
-[ -f "$API_KEY_FILE" ] || fail "App Store Connect API key not found at $API_KEY_FILE
-  Download from App Store Connect → Users → Keys and place it there."
+    if [ -z "$API_KEY_ID" ] || [ -z "$API_ISSUER_ID" ]; then
+        [ -n "$API_KEY_ID" ] || problem "$PUSHBACK_ASC_KEY_ID_VAR not set. Add it to $ENV_FILE or export it."
+        [ -n "$API_ISSUER_ID" ] || problem "$PUSHBACK_ASC_ISSUER_ID_VAR not set. Add it to $ENV_FILE or export it."
+    else
+        API_KEY_FILE="$PUSHBACK_ASC_KEY_DIR/AuthKey_${API_KEY_ID}.p8"
+        check "App Store Connect key $API_KEY_FILE" "App Store Connect API key not found at $API_KEY_FILE
+  Download it from App Store Connect → Users and Access → Integrations → Keys and place it there." \
+            test -f "$API_KEY_FILE"
+    fi
 
-[ -f "$PROJECT_YML" ] || fail "project.yml not found at $PROJECT_YML (check PUSHBACK_APP_DIR in $CONFIG_PATH)."
+    if [ -f "$PROJECT_YML" ]; then
+        local v b; v="$(read_version)"; b="$(read_build)"
+        if [ -n "$v" ] && [[ "$b" =~ ^[0-9]+$ ]]; then
+            check_ok "$PUSHBACK_PROJECT_YML at $v ($b)"
+        else
+            problem "Couldn't read MARKETING_VERSION and an integer CURRENT_PROJECT_VERSION from $PROJECT_YML."
+        fi
+    else
+        problem "project.yml not found at $PROJECT_YML (check PUSHBACK_APP_DIR in $CONFIG_PATH)."
+    fi
+
+    # The bump runs after the merge in PR mode, so a missing script found then
+    # means a merged PR and nothing shipped.
+    case "$PUSHBACK_BUMP_SCRIPT" in
+        */*) if (cd "$APP_DIR" 2>/dev/null && [ -x "$PUSHBACK_BUMP_SCRIPT" ]); then
+                 check_ok "bump script $PUSHBACK_BUMP_SCRIPT"
+             else
+                 problem "Bump script $PUSHBACK_BUMP_SCRIPT isn't an executable file (relative to $APP_DIR). Set PUSHBACK_BUMP_SCRIPT or chmod +x it."
+             fi ;;
+        *)   check "bump script $PUSHBACK_BUMP_SCRIPT" "Bump script '$PUSHBACK_BUMP_SCRIPT' not found on PATH." \
+                 command -v "$PUSHBACK_BUMP_SCRIPT" ;;
+    esac
+
+    # destination=upload is what makes -exportArchive upload. With "export" it
+    # writes an IPA, exits 0, uploads nothing, and the ship would be reported
+    # as done, with a bump committed for a build App Store Connect never saw.
+    if [ -f "$EXPORT_OPTIONS" ]; then
+        local dest
+        dest="$(/usr/libexec/PlistBuddy -c 'Print :destination' "$EXPORT_OPTIONS" 2>/dev/null || true)"
+        if [ "$dest" = "upload" ]; then
+            check_ok "$PUSHBACK_EXPORT_OPTIONS uploads (destination=upload)"
+        else
+            problem "$EXPORT_OPTIONS must set destination=upload (it has '${dest:-nothing}').
+  Otherwise the export writes an IPA and nothing reaches TestFlight."
+        fi
+    else
+        problem "Export options not found at $EXPORT_OPTIONS (set PUSHBACK_EXPORT_OPTIONS)."
+    fi
+}
+CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
+
+# ── pushback doctor ────────────────────────────────────────────────
+# Everything preflight checks, plus what a ship only finds out later: gh auth,
+# the simulator, origin, the build number, leftover state from earlier ships.
+
+if [ "$DOCTOR" = "1" ]; then
+    echo
+    printf '%s\n' "  ${BOLD}${BLUE}pushback doctor${RESET}  ${DIM}$PUSHBACK_VERSION · $PUSHBACK_PRODUCT_NAME · $CONFIG_PATH${RESET}"
+    echo
+    preflight
+    if command -v gh >/dev/null; then
+        check "gh is signed in" "gh isn't signed in, so PR mode can't merge. Fix: gh auth login" gh auth status
+    fi
+    if command -v xcbeautify >/dev/null; then
+        check_ok "xcbeautify found"
+    else
+        check_warn "xcbeautify not installed (optional, nicer build output): brew install xcbeautify"
+    fi
+    if command -v maestro >/dev/null; then
+        check "maestro flows in $PUSHBACK_APP_DIR/$PUSHBACK_MAESTRO_DIR" \
+            "maestro is installed but $APP_DIR/$PUSHBACK_MAESTRO_DIR doesn't exist (set PUSHBACK_MAESTRO_DIR)." \
+            test -d "$APP_DIR/$PUSHBACK_MAESTRO_DIR"
+    else
+        check_warn "maestro not installed (optional, UI smoke flows): curl -fsSL https://get.maestro.mobile.dev | bash"
+    fi
+    if command -v xcrun >/dev/null; then
+        if sim_out="$( (resolve_sim_udid "$PUSHBACK_SIM_DEVICE") 2>&1)"; then
+            check_ok "QA simulator: $(sim_label "$sim_out") $sim_out${PUSHBACK_SIM_DEVICE:+ (from PUSHBACK_SIM_DEVICE)}"
+        else
+            problem "$(printf '%s' "$sim_out" | sed '1s/^.*✗[^ ]* //')"
+        fi
+    fi
+    TARGET_BRANCH="${CURRENT_BRANCH:-main}"
+    if refresh_origin; then check_ok "origin reachable"; else problem "Couldn't fetch origin. PR mode needs it; from-main can't push without it."; fi
+    [ -f "$PROJECT_YML" ] && check_build_not_stale
+    burned="$(read_burned)"
+    [ -z "$burned" ] || check_ok "last build sent to App Store Connect from this clone: $burned"
+    for ref in $(bump_branches); do
+        b="${ref#refs/heads/}"; t="$(bump_target "$b")"
+        ob="$(build_at "refs/remotes/origin/$t")"; bb="$(build_at "$ref")"
+        if git -C "$REPO_ROOT" merge-base --is-ancestor "$ref" "refs/remotes/origin/$t" 2>/dev/null || \
+           { [[ "$ob" =~ ^[0-9]+$ ]] && [[ "$bb" =~ ^[0-9]+$ ]] && [ "$ob" -ge "$bb" ]; }; then
+            check_warn "branch $b is already on origin/$t. Delete it: git branch -D $b"
+        else
+            problem "Branch $b holds a build-$(build_at "$ref") bump that was uploaded but never pushed.
+  Push it: git push origin $b:refs/heads/$t, then: git branch -D $b"
+        fi
+    done
+    if [ -d "$LOCK_DIR" ]; then
+        read -r pid where <<<"$(lock_owner "$LOCK_DIR")"
+        if [ -n "$pid" ] && pid_alive "$pid"; then
+            check_warn "a ship is running right now (pid $pid, in ${where:-?})"
+        else
+            check_warn "stale ship lock at $LOCK_DIR (the next ship takes it over)"
+        fi
+    fi
+    echo
+    if [ "$DOCTOR_PROBLEMS" -eq 0 ]; then
+        printf '%s\n\n' "  ${GREEN}${BOLD}Ready to ship.${RESET}"
+        exit 0
+    fi
+    printf '%s\n\n' "  ${RED}${BOLD}$DOCTOR_PROBLEMS problem(s) to fix before shipping.${RESET}"
+    exit 1
+fi
+
+preflight
 
 # ── Mode detection ─────────────────────────────────────────────────
 
-CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 MODE=""
 PR_NUMBER=""
 
@@ -576,10 +950,22 @@ if [ -n "$ARG_PR" ]; then
     MODE="pr"; PR_NUMBER="$ARG_PR"
 elif [ "$FORCE_FROM_MAIN" = "1" ]; then
     MODE="main"
-elif [ "$CURRENT_BRANCH" != "main" ] && \
-     PR_NUMBER="$(gh pr view "$CURRENT_BRANCH" --json number,state --jq 'select(.state=="OPEN").number' 2>/dev/null)" && \
-     [ -n "$PR_NUMBER" ]; then
-    MODE="pr"
+elif [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ]; then
+    # "No PR" and "gh failed" must not look alike: treating a signed-out or
+    # offline gh as "no PR" would ship the PR branch as from-main, uploading
+    # unmerged code and pushing the bump to the PR branch.
+    gh_err="$(mktemp -t pushback-gh)"
+    if PR_NUMBER="$(gh pr view "$CURRENT_BRANCH" --json number,state --jq 'select(.state=="OPEN").number' 2>"$gh_err")"; then
+        rm -f "$gh_err"
+    elif grep -qi 'no pull requests found' "$gh_err"; then
+        rm -f "$gh_err"; PR_NUMBER=""
+    else
+        gh_msg="$(head -1 "$gh_err")"; rm -f "$gh_err"
+        fail "gh couldn't check whether $CURRENT_BRANCH has an open PR: ${gh_msg:-no output}
+  pushback won't guess. Shipping a PR branch from-main would upload unmerged code.
+  Fix gh (gh auth status), or pass --from-main to ship this branch as it is."
+    fi
+    if [ -n "$PR_NUMBER" ]; then MODE="pr"; else MODE="main"; fi
 else
     MODE="main"
 fi
@@ -606,6 +992,15 @@ if [ "$MODE" = "pr" ]; then
 else
     TARGET_BRANCH="$CURRENT_BRANCH"
     [ -n "$TARGET_BRANCH" ] || fail "HEAD is detached, so there's no branch to push the version bump to. Check out a branch first."
+    # Left by a detached ship whose push was rejected. Shipping "from" it would
+    # push a fresh remote branch of that name and burn another build; what it
+    # needs is the push that failed.
+    if is_bump_branch "$CURRENT_BRANCH"; then
+        fail "$CURRENT_BRANCH holds a bump commit (build $(read_build)) that an earlier ship uploaded but couldn't push.
+  Don't ship from it. Push it to $(bump_target "$CURRENT_BRANCH") instead (pull or rebase first if that's rejected):
+      git push origin HEAD:refs/heads/$(bump_target "$CURRENT_BRANCH")
+  Then clean up: git checkout --detach && git branch -D $CURRENT_BRANCH"
+    fi
     TOTAL_STEPS=6
 fi
 
@@ -614,6 +1009,11 @@ acquire_lock
 # Resolve the QA simulator now, so a bad name or a UDID an Xcode update
 # deleted fails in seconds rather than after the multi-minute verify build.
 [ "$SKIP_QA" = "1" ] || SIM_UDID="$(resolve_sim_udid "$PUSHBACK_SIM_DEVICE")"
+
+# One fetch for every remote-ref check below.
+if ! refresh_origin && [ "$MODE" = "pr" ]; then
+    fail "Couldn't fetch origin. PR mode needs it to merge the PR and sync main. Nothing was done."
+fi
 
 # ── Banner ─────────────────────────────────────────────────────────
 
@@ -627,15 +1027,16 @@ else
     printf "  ${DIM}%s · ios · %s → testflight${RESET}\n" "$PUSHBACK_PRODUCT_NAME" "$TARGET_BRANCH"
 fi
 printf "  ${DIM}version: %s (%s) → %s${RESET}\n" "$(read_version)" "$(read_build)" "$(predict_next)"
+[ -z "$SIM_UDID" ] || printf "  ${DIM}qa sim: %s %s${RESET}\n" "$(sim_label "$SIM_UDID")" "$SIM_UDID"
 [ "$USE_XCB" = "0" ] && printf '%s\n' "  ${DIM}tip: brew install xcbeautify for nicer build output${RESET}"
 echo
 hr
+[ "$ORIGIN_OK" = "1" ] || warn "Couldn't fetch origin. Build-number checks use the remote branches as last fetched, and the final push may fail."
 
 # ── From-main: dirty working tree handling ─────────────────────────
 # The build reads the working tree as-is, so "include" literally ships your
 # uncommitted changes. We always show exactly what that is before doing it.
 
-INCLUDE_DIRTY=0
 DIRTY_MENU_SHOWN=0   # set when the interactive menu is shown; that choice IS the confirm
 if [ "$MODE" = "main" ] && [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
     echo
@@ -649,10 +1050,12 @@ if [ "$MODE" = "main" ] && [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; t
     echo
 
     choice=""
-    if [ "$ASSUME_YES" = "1" ]; then
+    if [ -n "$DIRTY_CHOICE" ]; then
+        choice="${DIRTY_CHOICE:0:1}"   # --dirty include|stash|abort
+    elif [ "$ASSUME_YES" = "1" ]; then
         choice="i"   # --yes ⇒ include everything
     elif [ ! -t 0 ]; then
-        fail "Dirty tree needs a decision but stdin isn't a TTY. Re-run with --yes (include all) or commit/stash first."
+        fail "Dirty tree needs a decision but stdin isn't a TTY. Re-run with --dirty include|stash|abort, or commit/stash first."
     else
         DIRTY_MENU_SHOWN=1
         printf '%s\n' "  ${BOLD}Ship these changes?${RESET}"
@@ -699,15 +1102,13 @@ fi
 # project.yml edits in include mode, nothing in stash mode or on a clean tree.
 # Every later revert restores to this snapshot instead of HEAD.
 PRE_SHIP_PATCH="$(mktemp -t pushback-preship)"
-# shellcheck disable=SC2086
-git -C "$REPO_ROOT" diff --binary HEAD -- $PUSHBACK_COMMIT_PATHS >"$PRE_SHIP_PATCH" 2>/dev/null || true
+git -C "$REPO_ROOT" diff --binary HEAD -- "${COMMIT_PATHS[@]}" >"$PRE_SHIP_PATCH" 2>/dev/null || true
 
 # ── Behind-upstream check (informational) ──────────────────────────
 # A push after a successful upload that gets rejected is recoverable (the
 # trap tells you to pull+push), but better to know now. From-main only: in PR
 # mode HEAD is the PR branch, and the Sync main step fast-forwards explicitly.
 if [ "$MODE" = "main" ] && git -C "$REPO_ROOT" rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch --quiet origin "$TARGET_BRANCH" 2>/dev/null || true
     BEHIND="$(git -C "$REPO_ROOT" rev-list --count "HEAD..origin/${TARGET_BRANCH}" 2>/dev/null || echo 0)"
     if [ "${BEHIND:-0}" -gt 0 ]; then
         warn "Local $TARGET_BRANCH is $BEHIND commit(s) behind origin/$TARGET_BRANCH. The final push may need a manual pull."
@@ -730,8 +1131,7 @@ else
     else
         SYNC_DETACHED=0
     fi
-    git -C "$REPO_ROOT" fetch --quiet origin main 2>/dev/null || true
-    check_build_not_stale "$(build_at refs/remotes/origin/main)"
+    check_build_not_stale "$(build_at refs/remotes/origin/main)" "origin/main (which this PR would ship from)"
     if [ "$SYNC_DETACHED" = "0" ] && git -C "$REPO_ROOT" rev-parse -q --verify refs/heads/main >/dev/null && \
        ! git -C "$REPO_ROOT" merge-base --is-ancestor refs/heads/main refs/remotes/origin/main; then
         fail "Local main has diverged from origin/main (an unpushed bump commit?). Nothing was merged.
@@ -912,11 +1312,20 @@ fi
 
 step "Bump version"
 (cd "$APP_DIR" && xcodegen generate >/dev/null)
+OLD_BUILD="$(read_build)"
 (cd "$APP_DIR" && "$PUSHBACK_BUMP_SCRIPT" "$PUSHBACK_BUMP_LEVEL")
 VERSION_BUMPED=1
 (cd "$APP_DIR" && xcodegen generate >/dev/null)
 NEW_VERSION="$(read_version)"
 NEW_BUILD="$(read_build)"
+# The bump script is the user's. If it didn't raise the build, archiving would
+# upload a number that is already in App Store Connect.
+burned="$(read_burned)"
+if ! [[ "$NEW_BUILD" =~ ^[0-9]+$ ]] || [ "$NEW_BUILD" -le "$OLD_BUILD" ] || \
+   { [ -n "$burned" ] && [ "$NEW_BUILD" -le "$burned" ]; }; then
+    fail "$PUSHBACK_BUMP_SCRIPT left the build at '${NEW_BUILD:-?}' (was $OLD_BUILD${burned:+, last uploaded $burned}).
+  It must raise CURRENT_PROJECT_VERSION in $PROJECT_YML. Nothing was archived or uploaded."
+fi
 info "→ $NEW_VERSION ($NEW_BUILD)"
 step_done
 
@@ -944,7 +1353,12 @@ step_done
 # upload has already succeeded.
 
 step "Upload to TestFlight"
-[ "$DRY_RUN" = "0" ] && UPLOAD_ATTEMPTED=1
+if [ "$DRY_RUN" = "0" ]; then
+    UPLOAD_ATTEMPTED=1
+    # Before the upload starts, not after: a kill mid-upload must still leave
+    # the number on record as possibly burned.
+    record_burned "$NEW_BUILD"
+fi
 run_xcodebuild -exportArchive \
     -archivePath "$ARCHIVE_PATH" \
     -exportOptionsPlist "$EXPORT_OPTIONS" \
@@ -955,9 +1369,10 @@ run_xcodebuild -exportArchive \
     -authenticationKeyIssuerID "$API_ISSUER_ID" \
     || fail "Export/upload failed."
 [ "$DRY_RUN" = "0" ] && UPLOAD_SUCCEEDED=1
-# The archive's DerivedData is ~2 GB and nothing downstream reads it (export
-# works off the .xcarchive), so reclaim it now rather than at the final sweep.
-rm -rf "$ARCHIVE_BUILD_DIR"
+# Nothing after the upload reads build/ (the archive's DerivedData alone is
+# ~2 GB), and it must be gone before the commit: include mode's `git add -A`
+# would otherwise commit the .xcarchive in a repo that doesn't ignore build/.
+remove_build_artifacts
 step_done
 
 # ── Step: Commit + push version bump ───────────────────────────────
@@ -982,17 +1397,18 @@ else
 
 Includes uncommitted working-tree changes present at ship time."
     else
-        # shellcheck disable=SC2086
-        git -C "$REPO_ROOT" add $PUSHBACK_COMMIT_PATHS
+        git -C "$REPO_ROOT" add -- "${COMMIT_PATHS[@]}"
         COMMIT_MSG="chore: bump iOS to $NEW_VERSION ($NEW_BUILD)"
     fi
     if [ "${SYNC_DETACHED:-0}" = "1" ]; then
         # Put the bump commit on a branch BEFORE the push can fail. On a bare
         # detached HEAD it would be orphaned by the next checkout and invisible
         # to check_build_not_stale, so a later ship could reuse this burned
-        # number. Removed again once the push lands.
-        BUMP_BRANCH="pushback/unpushed-bump-$NEW_BUILD"
+        # number. Removed again once the push lands. The target is recorded so
+        # the recovery hint (and a re-run from this branch) can name it.
+        BUMP_BRANCH="pushback-unpushed-bump-$NEW_BUILD"
         git -C "$REPO_ROOT" checkout --quiet -B "$BUMP_BRANCH"
+        git -C "$REPO_ROOT" config "branch.$BUMP_BRANCH.pushbackTarget" "$TARGET_BRANCH"
     fi
     git -C "$REPO_ROOT" commit --quiet -m "$COMMIT_MSG"
     VERSION_BUMP_COMMITTED=1
@@ -1010,7 +1426,7 @@ fi
 
 # ── Done ───────────────────────────────────────────────────────────
 
-rm -rf "$APP_DIR/build"
+remove_build_artifacts
 [ -z "$PRE_SHIP_PATCH" ] || rm -f "$PRE_SHIP_PATCH"
 
 TOTAL=$((SECONDS - SHIP_START))
