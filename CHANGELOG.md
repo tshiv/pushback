@@ -3,7 +3,7 @@
 All notable changes to `pushback` are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-11-06
 
 ### Added
 - **A test suite, run in CI.** `test/run.sh` drives the real script end to end, 86 scenarios, against stubbed `xcodebuild`, `xcrun simctl`, `gh`, `xcodegen` and `maestro` and a throwaway local git remote, on the bash 3.2 at `/bin/bash`. It covers both modes, worktrees, fork PRs, every failure point around the upload, signals (including a real pseudo-terminal being closed or Ctrl-C'd mid-archive), the lock, the simulator lifecycle, and each fix below. CI runs it on macOS for every PR, next to ShellCheck.
@@ -71,5 +71,6 @@ Initial release. Extracted from the `ios/ship.sh` tooling in a private app repo.
 - Config via a sourced `.pushbackrc` shell file (no YAML dependency).
 - Burned-build-number safety: a bump is never reverted once the upload has succeeded.
 
+[0.2.0]: https://github.com/tshiv/pushback/releases/tag/v0.2.0
 [0.1.1]: https://github.com/tshiv/pushback/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tshiv/pushback/releases/tag/v0.1.0
